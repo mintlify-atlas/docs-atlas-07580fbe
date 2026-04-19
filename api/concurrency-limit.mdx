@@ -1,0 +1,203 @@
+---
+title: "withConcurrencyLimit() API reference"
+description: "API reference for withConcurrencyLimit(). Run Futures with a max concurrency cap, processing queued tasks as slots free up. Includes TypeScript signatures."
+---
+
+`withConcurrencyLimit()` runs an iterable of `Future` instances with a ceiling on how many execute at the same time. As each active future completes, the next one from the iterable is started, keeping the number of in-flight futures at or below `limit` at all times. This is the right primitive when you have more tasks than you want to run concurrently — for example, when calling an API with a rate limit or processing a large file queue without exhausting memory.
+
+## Signature
+
+```typescript
+function withConcurrencyLimit<T, TReturn = T, TNext = unknown>(
+  futures: Iterable<Future<T, TReturn, TNext>>,
+  limit: number,
+): Future<T, (T | TReturn)[], TNext>
+```
+
+## Parameters
+
+<ParamField path="futures" type="Iterable<Future<T, TReturn, TNext>>" required>
+  An iterable of `Future` instances to execute. Futures are started in iteration order, up to `limit` at a time. As slots free up, the next future from the iterable is started automatically.
+</ParamField>
+
+<ParamField path="limit" type="number" required>
+  The maximum number of futures that may be active concurrently. Must be a positive integer. If the iterable contains fewer futures than `limit`, only the available futures run — the limit is a ceiling, not a target.
+</ParamField>
+
+## Return value
+
+<ResponseField name="return" type="Future<T, (T | TReturn)[], TNext>">
+  A `Future` that yields intermediate values from active futures as they become available, and returns an array of all final return values in completion order.
+</ResponseField>
+
+<Note>
+  `limit` is a maximum, not a guaranteed count. If you pass an iterable with only two futures and a limit of 10, exactly two futures run concurrently. The limit is never exceeded, but it may not be reached if the input is smaller.
+</Note>
+
+## Examples
+
+### Basic usage
+
+```typescript
+import { from, withConcurrencyLimit } from "@okikio/future";
+
+const futures = [
+  from(async function* () { yield 42; return 100; }),
+  from(async function* () { yield 10; return 20; }),
+];
+
+const limitedFuture = withConcurrencyLimit(futures, 2);
+
+// Receive intermediate yielded values from active futures
+for await (const value of limitedFuture) {
+  console.log(value); // 42, 10 (order depends on completion timing)
+}
+
+// Collect all final return values
+const finalResults = await limitedFuture.toPromise();
+console.log(finalResults); // [100, 20]
+```
+
+### I/O-bound tasks
+
+When each task involves waiting — for a network response, a timer, or a disk read — limiting concurrency prevents the system from opening too many connections or handles simultaneously.
+
+```typescript
+import { from, withConcurrencyLimit } from "@okikio/future";
+
+const simulateIO = (duration: number) =>
+  from(async function* () {
+    yield `Starting task for ${duration}ms`;
+    await new Promise(resolve => setTimeout(resolve, duration));
+    return `Completed task for ${duration}ms`;
+  });
+
+const futures = [
+  simulateIO(500),
+  simulateIO(1000),
+  simulateIO(200),
+  simulateIO(800),
+  simulateIO(300),
+];
+
+// At most 2 tasks run at the same time
+const limitedFuture = withConcurrencyLimit(futures, 2);
+
+for await (const value of limitedFuture) {
+  console.log(value); // Starting/completing messages as tasks progress
+}
+
+const finalResults = await limitedFuture.toPromise();
+console.log(finalResults); // Completion messages in order of finishing
+```
+
+### API requests with rate limiting
+
+When calling a paginated or rate-limited API, `withConcurrencyLimit()` lets you maximise throughput while staying within the allowed concurrency budget.
+
+```typescript
+import { from, withConcurrencyLimit } from "@okikio/future";
+
+const apiRequest = (url: string) =>
+  from(async function* () {
+    yield `Fetching ${url}`;
+    const response = await fetch(url);
+    return await response.json();
+  });
+
+const urls = [
+  "https://api.example.com/1",
+  "https://api.example.com/2",
+  "https://api.example.com/3",
+  "https://api.example.com/4",
+  "https://api.example.com/5",
+];
+
+// Only 3 requests in flight at any moment
+const limitedFuture = withConcurrencyLimit(urls.map(apiRequest), 3);
+
+for await (const value of limitedFuture) {
+  console.log(value); // "Fetching https://api.example.com/1", etc.
+}
+
+const results = await limitedFuture.toPromise();
+console.log(results); // Array of parsed JSON responses
+```
+
+### File operations
+
+```typescript
+import { from, withConcurrencyLimit } from "@okikio/future";
+
+const readFile = (path: string) =>
+  from(async function* () {
+    yield `Reading file: ${path}`;
+    const content = await Deno.readTextFile(path);
+    return content;
+  });
+
+const futures = [
+  readFile("/path/to/file1.txt"),
+  readFile("/path/to/file2.txt"),
+  readFile("/path/to/file3.txt"),
+  readFile("/path/to/file4.txt"),
+];
+
+const limitedFuture = withConcurrencyLimit(futures, 2);
+
+for await (const value of limitedFuture) {
+  console.log(value); // "Reading file: ..." messages
+}
+
+const contents = await limitedFuture.toPromise();
+console.log(contents); // File contents in completion order
+```
+
+## Comparison with other concurrency primitives
+
+<Tip>
+  Use `withConcurrencyLimit()` instead of `all()` when you have a large or unknown number of tasks and you do not want to start all of them at once. `all()` starts every future immediately — which is efficient for a handful of independent tasks, but can overwhelm connection pools, exceed rate limits, or spike memory usage when applied to hundreds or thousands of tasks.
+</Tip>
+
+<Tabs>
+  <Tab title="withConcurrencyLimit()">
+    Starts up to `limit` futures at once and queues the rest. As each active future completes, the next queued future begins. Best when you have many tasks and need a controlled degree of parallelism.
+
+    ```typescript
+    // Process 1000 records, 10 at a time
+    const results = await withConcurrencyLimit(
+      records.map(processRecord),
+      10,
+    ).toPromise();
+    ```
+  </Tab>
+  <Tab title="all()">
+    Starts every future simultaneously. Best when the number of futures is small and each is independent. Rejects if any future rejects.
+
+    ```typescript
+    // 3 independent requests — start them all at once
+    const [a, b, c] = await all([fetchA(), fetchB(), fetchC()]).toPromise();
+    ```
+  </Tab>
+  <Tab title="scope()">
+    Runs futures one at a time in sequence. Best when order matters or concurrent execution would cause side-effect conflicts.
+
+    ```typescript
+    // Write records to the database one by one, in order
+    await scope(records.map(writeRecord)).toPromise();
+    ```
+  </Tab>
+</Tabs>
+
+## Behavior details
+
+- Futures are started in the order they appear in the iterable.
+- At any given moment, at most `limit` futures are active.
+- As each future completes, `withConcurrencyLimit()` starts the next one from the iterable.
+- Intermediate values yielded by active futures are re-yielded by the outer future in the order they arrive (completion order, not input order).
+- The final return array is ordered by completion, not by input position.
+- Each future is registered with an `AsyncDisposableStack` to ensure cleanup on cancellation or error.
+
+<Warning>
+  If any active future throws, `withConcurrencyLimit()` propagates the error and stops starting new futures. Futures already running at the time of failure are disposed. If you need partial results despite individual failures, consider running each future through a try/catch wrapper or using `allSettled()` for a fully concurrent alternative.
+</Warning>

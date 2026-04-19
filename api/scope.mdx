@@ -1,0 +1,161 @@
+---
+title: "scope() API reference — sequential Future execution"
+description: "API reference for Future's scope() function. Runs an iterable of Futures sequentially, one at a time, with full push and pull workflow support."
+---
+
+`scope()` runs an iterable of `Future` instances one at a time, in order. Unlike `all()` or `withConcurrencyLimit()`, there is no concurrency — each future must complete before the next one starts. This makes `scope()` the right choice when the order of side effects matters or when downstream operations depend on earlier results.
+
+## Signature
+
+```typescript
+function scope<T, TReturn, TNext>(
+  futures: Iterable<Future<T, TReturn, TNext>>,
+): Future<T, (T | TReturn)[], TNext>
+```
+
+## Parameters
+
+<ParamField path="futures" type="Iterable<Future<T, TReturn, TNext>>" required>
+  An iterable of `Future` instances to execute sequentially. Each future runs to completion before the next is started. Only `Future` instances are accepted — unlike `all()` or `race()`, plain `PromiseLike` objects are not supported here.
+</ParamField>
+
+## Return value
+
+<ResponseField name="return" type="Future<T, (T | TReturn)[], TNext>">
+  A `Future` that yields intermediate values from each inner future as they execute, and returns an array containing the final return value of every inner future in order.
+</ResponseField>
+
+## Examples
+
+### Push-based workflow
+
+In a push-based workflow each inner future yields values autonomously. The consumer iterates with `for await...of` to receive intermediate values, and calls `toPromise()` to get the final array of return values.
+
+```typescript
+import { from, scope } from "@okikio/future";
+
+const scopeFuture = scope([
+  from(async function* () {
+    yield 42;
+    return 100;
+  }),
+  from(async function* () {
+    yield 10;
+    return 20;
+  }),
+]);
+
+// Receive intermediate yielded values
+for await (const result of scopeFuture) {
+  console.log(result); // 42, then 10
+}
+
+// Get the collected return values
+const finalResults = await scopeFuture.toPromise();
+console.log(finalResults); // [100, 20]
+```
+
+### Pull-based workflow
+
+In a pull-based workflow the inner futures wait for external input before proceeding. You drive the iteration manually by calling `iterator.next(value)` and passing in data that the generator receives as the resolved value of `yield`.
+
+```typescript
+import { from, scope } from "@okikio/future";
+
+const pullFuture = scope([
+  from(async function* () {
+    let result = { value: 42, done: false };
+
+    while (!result.done) {
+      result = await (yield result.value); // waits for external input
+    }
+
+    return result.value;
+  }),
+]);
+
+const iterator = pullFuture[Symbol.asyncIterator]();
+
+console.log(await iterator.next());
+// { value: 42, done: false }
+
+console.log(await iterator.next({ value: 100, done: true }));
+// { value: 100, done: true }
+```
+
+<Note>
+  When using pull-based iteration, the value you pass to `iterator.next(input)` becomes the resolved value of the `yield` expression inside the generator. This lets the consumer drive the generator step-by-step.
+</Note>
+
+### Sequential database writes
+
+`scope()` is well-suited to operations that must not overlap, such as writing to a database where row ordering matters.
+
+```typescript
+import { from, scope } from "@okikio/future";
+
+const writeRow = (data: Record<string, unknown>) =>
+  from(async function* () {
+    yield `Writing row: ${JSON.stringify(data)}`;
+    await db.insert(data);
+    return data.id;
+  });
+
+const results = await scope([
+  writeRow({ id: 1, value: "first" }),
+  writeRow({ id: 2, value: "second" }),
+  writeRow({ id: 3, value: "third" }),
+]).toPromise();
+
+console.log(results); // [1, 2, 3] — IDs in insertion order
+```
+
+## When to use `scope()` vs. other concurrency primitives
+
+<Tabs>
+  <Tab title="scope() — sequential">
+    Choose `scope()` when execution order matters and concurrent execution would cause problems. Each future sees a consistent world because previous futures have fully completed before the next one starts.
+
+    **Best for:** ordered writes, step-by-step workflows, rate-limited external APIs where you can only make one call at a time.
+
+    ```typescript
+    // Migrate records one at a time, in order
+    await scope(records.map(r => migrateRecord(r))).toPromise();
+    ```
+  </Tab>
+  <Tab title="all() — fully concurrent">
+    Choose `all()` when all futures are independent and you want maximum throughput. All futures start immediately and run in parallel. Rejects if any single future rejects.
+
+    **Best for:** fetching independent resources, fan-out with a required success guarantee.
+
+    ```typescript
+    // Fetch all resources in parallel
+    const [user, config, flags] = await all([
+      fetchUser(),
+      fetchConfig(),
+      fetchFlags(),
+    ]).toPromise();
+    ```
+  </Tab>
+  <Tab title="withConcurrencyLimit() — bounded concurrent">
+    Choose `withConcurrencyLimit()` when you have many independent futures but need to cap how many run at once to avoid overwhelming downstream services or exhausting connection pools.
+
+    **Best for:** processing large queues of tasks with a controlled degree of parallelism.
+
+    ```typescript
+    // Process 100 items, 5 at a time
+    await withConcurrencyLimit(items.map(processItem), 5).toPromise();
+    ```
+  </Tab>
+</Tabs>
+
+## Behavior details
+
+- Each future is run to completion (including async cleanup via `Symbol.asyncDispose`) before the next one begins.
+- Intermediate values yielded by inner futures are re-yielded by the outer `scope()` future, so `for await...of` receives them in the order they are produced.
+- The final return value is an array of the return values of all inner futures, in the original input order.
+- If any inner future throws, `scope()` propagates the error and stops processing remaining futures.
+
+<Warning>
+  If an inner future throws, the futures after it in the iterable are never started. If you need resilience to individual failures, wrap each inner future's operation in a try/catch, or use `allSettled()` for concurrent execution with error isolation.
+</Warning>

@@ -1,0 +1,126 @@
+---
+title: "withAbortable() — AbortSignal linking API reference"
+description: "API reference for withAbortable(). Link a Future to an AbortController or AbortSignal so it cancels automatically when the external signal fires."
+---
+
+`withAbortable()` bridges the standard Web API `AbortController` / `AbortSignal` ecosystem and the `Future` lifecycle. Once linked, any abort event on the signal — whether triggered by a user action, a `fetch` cancellation, or another library — is forwarded to the Future as a cancellation with the signal's own abort reason. This means you can pass a single `AbortController` across multiple APIs and have everything cancel in unison.
+
+---
+
+## Signature
+
+```typescript
+function withAbortable<T, TReturn, TNext>(
+  future: Future<T, TReturn, TNext>,
+  abort: AbortController | AbortSignal,
+): Future<T | TReturn, T | TReturn, TNext>
+```
+
+Links a Future to an external `AbortController` or `AbortSignal`. When the signal fires, `future.cancel(signal.reason)` is called. If the signal is already aborted at the time `withAbortable()` is called, the Future is cancelled immediately when it starts executing.
+
+The original `future` is registered on the internal `AsyncDisposableStack`, so its resources are cleaned up automatically when the outer Future is disposed. The `abort` event listener is removed in the `finally` block — no listener leaks regardless of how the Future ends.
+
+<ParamField path="future" type="Future<T, TReturn, TNext>" required>
+  The Future to link to the abort signal. Its type parameters flow through to the returned Future.
+</ParamField>
+
+<ParamField path="abort" type="AbortController | AbortSignal" required>
+  The external abort handle. Pass an `AbortController` if you also want to hold a reference to `controller.abort()`, or pass an `AbortSignal` directly if the controller is owned elsewhere (for example, by a `fetch` call or a framework router).
+</ParamField>
+
+<ResponseField name="return" type="Future<T | TReturn, T | TReturn, TNext>">
+  A new Future that behaves identically to the original but will cancel when the external signal is aborted. The union type `T | TReturn` reflects that either yielded values or the final return value may propagate from the inner generator.
+</ResponseField>
+
+<Note>
+  Cleanup is automatic. The `"abort"` event listener added to the signal is removed in the `finally` block of the internal generator — whether the Future completes successfully, throws, or is cancelled. You do not need to manually remove it.
+</Note>
+
+---
+
+## Examples
+
+### Using an `AbortController`
+
+```typescript
+import { from, withAbortable } from "@okikio/future";
+
+const controller = new AbortController();
+const future = from(async function* () {
+  yield 42;
+  return 100;
+});
+
+const abortableFuture = withAbortable(future, controller);
+setTimeout(() => controller.abort(), 1000); // cancel after 1 second
+
+try {
+  const result = await abortableFuture.toPromise();
+  console.log(result);
+} catch (error) {
+  console.log("Future was aborted:", error);
+}
+```
+
+### Using an existing `AbortSignal`
+
+Pass `controller.signal` directly when you do not need to hold a reference to the controller inside `withAbortable()`. This is useful when the signal is handed to you by another API.
+
+```typescript
+import { from, withAbortable } from "@okikio/future";
+
+const controller = new AbortController();
+const future = from(async function* () {
+  yield 42;
+  return 100;
+});
+
+// Pass the signal instead of the controller
+const abortableFuture = withAbortable(future, controller.signal);
+setTimeout(() => controller.abort(), 1000);
+
+try {
+  const result = await abortableFuture.toPromise();
+} catch (error) {
+  console.log("Future was aborted:", error);
+}
+```
+
+### Practical use case: cancellable `fetch`
+
+This pattern lets you share a single `AbortController` between a `fetch` call and a Future, so aborting the controller cancels both simultaneously.
+
+```typescript
+import { from, withAbortable } from "@okikio/future";
+
+function fetchWithCancel(url: string, signal: AbortSignal) {
+  const future = from(async function* () {
+    const response = await fetch(url, { signal });
+    return await response.json();
+  });
+  return withAbortable(future, signal);
+}
+
+const controller = new AbortController();
+const data = fetchWithCancel("https://api.example.com/data", controller.signal);
+
+// Cancel from a button click or navigation event
+document.querySelector("#cancel")?.addEventListener("click", () => {
+  controller.abort();
+});
+
+try {
+  const result = await data.toPromise();
+  console.log(result);
+} catch (e) {
+  console.log("Fetch was cancelled");
+}
+```
+
+<Warning>
+  If the `AbortSignal` is already in the aborted state when the Future starts executing, the Future is cancelled immediately — before any `yield` runs. Check `signal.aborted` before calling `withAbortable()` if you want to avoid creating a Future that will never produce values.
+</Warning>
+
+<Tip>
+  `withAbortable()` forwards `signal.reason` verbatim as the cancellation reason. If you abort with `controller.abort(new DOMException("User cancelled", "AbortError"))`, that exact error surfaces in the Future's rejection. Use this to distinguish abort reasons in your error handlers.
+</Tip>

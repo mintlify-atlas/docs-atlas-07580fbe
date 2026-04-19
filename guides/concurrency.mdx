@@ -1,0 +1,180 @@
+---
+title: "Concurrent execution with all, race, and concurrency limits"
+description: "Run multiple Futures concurrently using all, allSettled, race, some, and withConcurrencyLimit. Control parallelism and collect results as they resolve."
+---
+
+`@okikio/future` provides a set of concurrency primitives that mirror the `Promise` combinators you already know — but with the added ability to yield intermediate values, integrate with `for await...of` loops, and cancel in-flight work. Each primitive returns a `Future`, so you can compose them freely with the rest of the library.
+
+## `all(futures)`
+
+`all` runs every Future in the input iterable at the same time and waits until every one of them has settled. Its return value yields each result in turn, then resolves to an array of all final values — the same semantic as `Promise.all`, but wrapped in a Future.
+
+```typescript
+import { from, all } from "@okikio/future";
+
+const result = await all([
+  from(async function* () { yield 1; return 2; }),
+  from(async function* () { yield 3; return 4; }),
+]).toPromise(); // [2, 4]
+```
+
+<Note>
+  If any Future in the array rejects, `all` propagates the first rejection and the remaining Futures are cancelled via the shared `DisposableStack`.
+</Note>
+
+## `allSettled(futures)`
+
+`allSettled` runs all Futures concurrently and yields a `PromiseSettledResult` for each one as they finish, regardless of whether they fulfilled or rejected. This mirrors `Promise.allSettled` and is the right choice when you need to process every outcome individually.
+
+```typescript
+import { from, allSettled } from "@okikio/future";
+
+const future1 = from(async function* () { yield 42; return 100; });
+const future2 = from(async function* () { throw new Error("oops"); });
+
+for await (const result of allSettled([future1, future2])) {
+  if (result.status === "fulfilled") {
+    console.log(result.value);  // 100
+  } else {
+    console.error(result.reason); // Error: oops
+  }
+}
+```
+
+## `race(futures)`
+
+`race` resolves as soon as the first Future settles and returns that value. All other Futures are still tracked through the shared `DisposableStack` for cleanup.
+
+```typescript
+import { from, race } from "@okikio/future";
+
+const slowFuture = from(async function* () {
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  return "slow";
+});
+
+const fastFuture = from(async function* () {
+  await new Promise(resolve => setTimeout(resolve, 100));
+  return "fast";
+});
+
+const winner = await race([slowFuture, fastFuture]).toPromise(); // "fast"
+```
+
+## `some(futures, count)`
+
+`some` runs all Futures concurrently but only collects results for the first `count` of them. Internally it is implemented as `allSettled` over the first `count` elements of the input, so you receive `PromiseSettledResult` values and partial failures are handled gracefully.
+
+```typescript
+import { from, some } from "@okikio/future";
+
+const futures = [
+  from(async function* () { return "a"; }),
+  from(async function* () { return "b"; }),
+  from(async function* () { return "c"; }),
+];
+
+for await (const result of some(futures, 2)) {
+  if (result.status === "fulfilled") {
+    console.log(result.value); // "a", "b"
+  }
+}
+```
+
+## `withConcurrencyLimit(futures, limit)`
+
+`withConcurrencyLimit` is the workhorse for throttled parallelism. It keeps at most `limit` Futures running at any one time, starting new ones as slots open up. Intermediate `yield` values from each Future are forwarded as they arrive, and the final `.toPromise()` call returns an array of all return values in completion order.
+
+This is the right tool when you have a large list of tasks (network requests, file reads, CPU work) and want to cap resource usage without losing throughput.
+
+```typescript
+import { from, withConcurrencyLimit } from "@okikio/future";
+
+const apiRequest = (url: string) =>
+  from(async function* () {
+    yield `Fetching ${url}`;
+    const response = await fetch(url);
+    return await response.json();
+  });
+
+const urls = [
+  "https://api.example.com/1",
+  "https://api.example.com/2",
+  "https://api.example.com/3",
+  "https://api.example.com/4",
+  "https://api.example.com/5",
+];
+
+const futures = urls.map(apiRequest);
+const limitedFuture = withConcurrencyLimit(futures, 3);
+
+for await (const value of limitedFuture) {
+  console.log(value); // Intermediate values as they resolve
+}
+
+const finalResults = await limitedFuture.toPromise();
+console.log(finalResults); // Array of JSON responses in completion order
+```
+
+<Tip>
+  The `limit` parameter applies to simultaneously-running Futures, not total Futures. As each one completes, the next one from the iterable starts immediately.
+</Tip>
+
+## `scope(futures)`
+
+`scope` runs a list of Futures sequentially — one at a time — rather than concurrently. It supports both push-based and pull-based workflows, and collects each Future's return value into a final results array. Use `scope` when ordering matters or when Futures depend on each other's output.
+
+```typescript
+import { from, scope } from "@okikio/future";
+
+const scopeFuture = scope([
+  from(async function* () { yield 42; return 100; }),
+  from(async function* () { yield 10; return 20; }),
+]);
+
+for await (const result of scopeFuture) {
+  console.log(result); // 42, 10 (intermediate yields)
+}
+
+const finalResults = await scopeFuture.toPromise(); // [100, 20]
+```
+
+## Choosing the right primitive
+
+<Tabs>
+  <Tab title="Comparison table">
+    | Primitive               | Runs futures       | Returns                            | Use when                                              |
+    | ----------------------- | ------------------ | ---------------------------------- | ----------------------------------------------------- |
+    | `all`                   | Concurrently (all) | Array of return values             | All must succeed; order doesn't matter                |
+    | `allSettled`            | Concurrently (all) | `PromiseSettledResult[]`           | You need every outcome, including failures            |
+    | `race`                  | Concurrently (all) | First settled value                | You only need the fastest result                      |
+    | `some`                  | Concurrently (all) | First N `PromiseSettledResult`     | You need the first N results, failures included       |
+    | `withConcurrencyLimit`  | Concurrently (≤N)  | Array of return values             | Large batches with a cap on simultaneous work         |
+    | `scope`                 | Sequentially (1×1) | Array of return values             | Order matters or Futures depend on previous results   |
+  </Tab>
+  <Tab title="Decision guide">
+    <Steps>
+      <Step title="Do all futures need to succeed?">
+        Yes → use `all`. No, and you need to handle each outcome → use `allSettled`.
+      </Step>
+      <Step title="Do you only care about the first result?">
+        Yes → use `race`. First N results → use `some`.
+      </Step>
+      <Step title="Do you have more work than you can run at once?">
+        Yes → use `withConcurrencyLimit` with an appropriate `limit`.
+      </Step>
+      <Step title="Must futures run one after another?">
+        Yes → use `scope`.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+<CardGroup cols={2}>
+  <Card title="Error handling" icon="circle-exclamation" href="/guides/error-handling">
+    Learn how cancellation, `CancellationError`, and `split()` work together for resilient pipelines.
+  </Card>
+  <Card title="Background execution" icon="moon" href="/guides/background-execution">
+    Run concurrent batches during idle time with `inBackground()`.
+  </Card>
+</CardGroup>

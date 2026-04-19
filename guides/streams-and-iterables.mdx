@@ -1,0 +1,262 @@
+---
+title: "Working with streams, iterables, and generators in Future"
+description: "Convert ReadableStreams, async iterables, arrays, and Promises into Futures using from(). Split, transform, and compose async data sources with type safety."
+---
+
+`from()` is the primary entry point for wrapping existing async data sources in a `Future`. It inspects the input type at runtime and delegates to the most appropriate internal constructor — so you get the same composable, cancellable `Future` interface regardless of whether your data comes from a `ReadableStream`, an async generator, a plain array, or a `Promise`.
+
+<Note>
+  `from()` automatically detects the input type and creates the appropriate Future. You do not need to choose a specific constructor for each source — pass in what you have and `from()` handles the rest.
+</Note>
+
+## From a `ReadableStream`
+
+When you pass a `ReadableStream`, `from()` delegates to `fromStream()`, which reads chunks using `getReader()` and yields each one. The reader lock is always released in `finally`, even if the Future is cancelled mid-stream.
+
+```typescript
+import { from } from "@okikio/future";
+
+const response = await fetch("https://api.example.com/large-file");
+const future = from(response.body!);
+
+for await (const chunk of future) {
+  console.log(chunk); // Process each Uint8Array chunk
+}
+```
+
+<Tip>
+  `fromStream()` is ideal for progress tracking of fetch responses. Because each chunk is yielded individually, you can update a progress bar or accumulate a byte count inside the `for await` loop before the full response has arrived.
+</Tip>
+
+You can also call `fromStream()` directly if you prefer explicit typing:
+
+```typescript
+import { fromStream } from "@okikio/future";
+
+const stream = new ReadableStream<Uint8Array>({
+  pull(controller) {
+    controller.enqueue(new Uint8Array([1, 2, 3]));
+    controller.close();
+  },
+});
+
+const future = fromStream(stream);
+
+for await (const chunk of future) {
+  console.log(chunk); // Logs Uint8Array([1, 2, 3])
+}
+```
+
+## From an async iterable or async generator
+
+Async generators and other objects implementing `Symbol.asyncIterator` are handled by `fromIterable()`. The generator's `yield` values become the Future's intermediate values; the final `return` value becomes the Future's resolved result.
+
+```typescript
+import { from } from "@okikio/future";
+
+async function* dataSource() {
+  yield 1;
+  yield 2;
+  yield 3;
+}
+
+const future = from(dataSource());
+
+for await (const value of future) {
+  console.log(value); // Logs 1, 2, 3
+}
+```
+
+Passing an async generator *function* (rather than an already-started iterator) is also supported:
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1;
+  yield 2;
+  return 3;
+});
+
+const result = await future.toPromise(); // 3
+```
+
+## From a synchronous array or iterable
+
+Built-in iterables (arrays, strings, `Set`, `Map`, etc.) are handled by `fromBuiltinIterable()`. Each element is yielded in order, and the original iterable is returned as the final resolved value.
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from([1, 2, 3]);
+
+for await (const value of future) {
+  console.log(value); // Logs 1, 2, 3
+}
+```
+
+<Note>
+  `from()` distinguishes between built-in iterables (arrays, strings) and custom iterables. Built-in iterables never return a meaningful value on their own, so `fromBuiltinIterable` returns the original iterable as the resolved result rather than `undefined`.
+</Note>
+
+## From a `Promise`
+
+Passing a `PromiseLike` wraps it in a Future that yields the resolved value once and then resolves to the same value.
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(Promise.resolve(42));
+const result = await future.toPromise(); // 42
+```
+
+This is useful when integrating `Future`-based code with existing Promise-returning APIs, since the result can then be composed with other Future utilities like `all` or `withConcurrencyLimit`.
+
+## From a raw iterator
+
+If you have an already-started iterator (sync or async), pass it directly to `from()` or `fromIterator()`. The iterator is driven to completion and each yielded value is forwarded.
+
+```typescript
+import { from } from "@okikio/future";
+
+function* syncGenerator() {
+  yield "a";
+  yield "b";
+  return "c";
+}
+
+const iterator = syncGenerator();
+const future = from(iterator);
+
+for await (const value of future) {
+  console.log(value); // "a", "b"
+}
+const result = await future.toPromise(); // "c"
+```
+
+## Splitting a Future into two streams
+
+### `split(future)` — values vs. errors
+
+`split()` tees the underlying iterator into two Futures: one that receives yielded values and one that receives thrown errors. This lets you route successes and failures to separate handlers without nesting try/catch.
+
+```typescript
+import { from, split } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1;
+  yield 2;
+  throw new Error("Oops");
+});
+
+const [values, errors] = split(future);
+
+values.then(console.log);  // Logs 1, 2
+errors.catch(console.error); // Logs Error: Oops
+```
+
+### `splitBy(future, predicate)` — partition by condition
+
+`splitBy()` splits a Future into two streams based on a predicate function. Values for which the predicate returns `true` go to the first Future; all others go to the second.
+
+```typescript
+import { from, splitBy } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1;
+  yield 2;
+  yield 3;
+  yield 4;
+  yield 5;
+  yield 6;
+});
+
+const isEven = (n: number) => n % 2 === 0;
+const [evens, odds] = splitBy(future, isEven);
+
+for await (const even of evens) {
+  console.log(even); // 2, 4, 6
+}
+
+for await (const odd of odds) {
+  console.log(odd); // 1, 3, 5
+}
+```
+
+## Composing with transforms
+
+Because every `from()` result is a standard `Future`, you can chain operations by passing a `Future` back into `from()` (which returns it unchanged) or by constructing a new generator that drives an existing one:
+
+```typescript
+import { from } from "@okikio/future";
+
+const source = from([1, 2, 3, 4, 5]);
+
+// Transform by wrapping in a new generator
+const doubled = from(async function* () {
+  for await (const value of source) {
+    yield value * 2;
+  }
+  return "done";
+});
+
+for await (const value of doubled) {
+  console.log(value); // 2, 4, 6, 8, 10
+}
+```
+
+## `from()` input type reference
+
+<Tabs>
+  <Tab title="Supported inputs">
+    | Input type                       | Internal function       | Yielded values                    | Resolved value                  |
+    | -------------------------------- | ----------------------- | --------------------------------- | ------------------------------- |
+    | `Future`                         | returned as-is          | same as original                  | same as original                |
+    | `ReadableStream<T>`              | `fromStream`            | stream chunks (`T`)               | `undefined`                     |
+    | `PromiseLike<T>`                 | `fromPromise`           | resolved value once               | resolved value                  |
+    | `AsyncIterator` / `Iterator`     | `fromIterator`          | iterator values                   | iterator return value           |
+    | `AsyncIterable` / `Iterable`     | `fromIterable`          | iterable values                   | iterable return value           |
+    | Built-in iterable (array, string)| `fromBuiltinIterable`   | each element                      | original iterable               |
+    | Generator function               | `fromOperation`         | yielded values                    | function return value           |
+    | Scalar value                     | `of`                    | value once                        | value                           |
+  </Tab>
+  <Tab title="Detection order">
+    `from()` checks input types in this order:
+
+    <Steps>
+      <Step title="Future instance">
+        Returns the Future directly — no wrapping needed.
+      </Step>
+      <Step title="ReadableStream">
+        Detected via `instanceof ReadableStream`. Delegates to `fromStream`.
+      </Step>
+      <Step title="PromiseLike">
+        Detected by the presence of a `.then` method. Delegates to `fromPromise`.
+      </Step>
+      <Step title="AsyncIterator or Iterator">
+        Detected by the presence of a `.next` method. Delegates to `fromIterator`.
+      </Step>
+      <Step title="AsyncIterable or Iterable (non-builtin)">
+        Detected by `Symbol.asyncIterator` or `Symbol.iterator`, excluding built-in iterables. Delegates to `fromIterable`.
+      </Step>
+      <Step title="Built-in iterable">
+        Arrays, strings, and other built-ins. Delegates to `fromBuiltinIterable`.
+      </Step>
+      <Step title="Function">
+        Async generator functions or regular functions. Delegates to `fromOperation`.
+      </Step>
+      <Step title="Scalar">
+        Any other value. Wrapped with `of()`.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+<CardGroup cols={2}>
+  <Card title="Error handling" icon="circle-exclamation" href="/guides/error-handling">
+    Use `split()` and `allSettled()` for resilient pipelines that handle partial failures.
+  </Card>
+  <Card title="Concurrent execution" icon="arrows-split-up-and-left" href="/guides/concurrency">
+    Combine stream-based Futures with `withConcurrencyLimit` to process multiple streams in parallel.
+  </Card>
+</CardGroup>

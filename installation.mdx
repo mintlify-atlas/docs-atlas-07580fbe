@@ -1,0 +1,157 @@
+---
+title: "Install Future in Deno, Node.js, Bun, or browsers"
+description: "Add @okikio/future to your project via JSR or npm. Supports sub-path imports for tree-shaking across Deno, Node.js, Bun, and Cloudflare Workers."
+---
+
+`@okikio/future` is published to both [JSR](https://jsr.io/@okikio/future) (for Deno-first workflows) and [npm](https://www.npmjs.com/package/@okikio/future) (for Node.js, Bun, pnpm, and bundlers). Choose the installation method that matches your runtime.
+
+## Install via JSR (Deno)
+
+JSR is the recommended installation path for Deno projects. You get native TypeScript, no build step, and automatic version resolution.
+
+<Steps>
+  <Step title="Add the package with deno add">
+    ```bash
+    deno add jsr:@okikio/future
+    ```
+
+    This updates your `deno.json` imports map automatically.
+  </Step>
+  <Step title="Import in your code">
+    ```typescript
+    import { from } from "@okikio/future";
+    ```
+  </Step>
+</Steps>
+
+You can also import directly from a URL without any install step:
+
+```typescript
+import { from } from "jsr:@okikio/future";
+```
+
+## Install via npm, Bun, or pnpm
+
+<CodeGroup>
+
+```bash npm
+npm install @okikio/future
+```
+
+```bash Bun
+bun add @okikio/future
+```
+
+```bash pnpm
+pnpm add @okikio/future
+```
+
+</CodeGroup>
+
+After installing, import from the package name:
+
+```typescript
+import { from, Future } from "@okikio/future";
+```
+
+## Sub-path imports
+
+`@okikio/future` ships individual modules as named exports. Importing from a sub-path instead of the root entry point lets bundlers tree-shake unused code, keeping your final bundle smaller.
+
+| Sub-path | Contents |
+|---|---|
+| `@okikio/future` | All exports — main entry point |
+| `@okikio/future/future` | `Future` class only |
+| `@okikio/future/from` | `from`, `fromPromise`, `fromStream`, `fromIterable`, `fromIterator`, `of`, `is` |
+| `@okikio/future/scope` | Structured concurrency scope utilities |
+| `@okikio/future/background` | `inBackground` for idle-time execution |
+| `@okikio/future/concurrency` | `all`, `allSettled`, `race`, `some`, `withConcurrencyLimit` |
+| `@okikio/future/resolvers` | `withResolvers` — externally resolved Futures |
+| `@okikio/future/deadline` | `withDeadline`, `delay` |
+| `@okikio/future/abortable` | `withAbortable` — link a Future to an external `AbortSignal` |
+| `@okikio/future/errors` | `CancellationError` and other error types |
+| `@okikio/future/split` | `split` — multicast a single Future to multiple consumers |
+| `@okikio/future/events` | Internal event dispatcher utilities |
+| `@okikio/future/disposal` | `AsyncDisposableStack` and disposal helpers |
+| `@okikio/future/iter` | Iterator composition utilities |
+| `@okikio/future/utils` | Internal utility helpers |
+| `@okikio/future/status` | `Status` enum and `StatusEvent` |
+| `@okikio/future/stream` | Stream-related utilities |
+
+**Example — import only what you need:**
+
+```typescript
+import { Future } from "@okikio/future/future";
+import { from } from "@okikio/future/from";
+import { withDeadline } from "@okikio/future/deadline";
+import { withAbortable } from "@okikio/future/abortable";
+import { withConcurrencyLimit } from "@okikio/future/concurrency";
+```
+
+## TypeScript configuration
+
+`@okikio/future` ships TypeScript source directly. No separate `@types` package is required.
+
+Some features — such as `fromStream()` which works with `ReadableStream` — reference browser globals. If you use these features outside a browser environment (for example in Node.js), add `"dom"` to the `lib` array in your `tsconfig.json`:
+
+```json tsconfig.json
+{
+  "compilerOptions": {
+    "lib": ["dom", "esnext"],
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "bundler"
+  }
+}
+```
+
+<Note>
+If you are only using core `Future` features (generators, cancellation, pause/resume) and not `ReadableStream`-specific utilities, you do not need `"lib": ["dom"]`. The `/// <reference lib="dom" />` directive in `future.ts` scopes the browser type requirement to that file.
+</Note>
+
+## Runtime compatibility
+
+| Runtime | Installation | Notes |
+|---|---|---|
+| Deno | JSR (`deno add jsr:@okikio/future`) or direct URL import | Full TypeScript, no build step |
+| Node.js | npm (`npm install @okikio/future`) | Requires Node.js 18+ for async generators and `AbortController` |
+| Bun | npm or JSR (`bun add @okikio/future`) | Drop-in compatible |
+| Cloudflare Workers | npm | No native module dependencies; works in the Workers runtime |
+| Browsers | ESM CDN or bundled via npm | Works in all modern evergreen browsers |
+
+<Tip>
+For Cloudflare Workers and browser targets, prefer sub-path imports to minimize bundle size. The root `@okikio/future` entry point re-exports everything, which may include modules your bundler cannot dead-code eliminate without manual configuration.
+</Tip>
+
+## Verify your installation
+
+Once installed, run this snippet to confirm everything is working:
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1;
+  yield 2;
+  return 3;
+});
+
+for await (const value of future) {
+  console.log(value); // Logs 1, 2
+}
+
+console.log(await future.toPromise()); // Logs 3
+```
+
+If you see the expected output, your installation is complete.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build your first Future and learn the core API patterns.
+  </Card>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Understand what problem Future solves and how it compares to Promises.
+  </Card>
+</CardGroup>

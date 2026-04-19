@@ -1,0 +1,130 @@
+---
+title: "withResolvers() — imperative Future control API reference"
+description: "API reference for withResolvers(). Create a Future with external resolve and reject handles — the Future equivalent of Promise.withResolvers()."
+---
+
+`withResolvers()` is the Future equivalent of `Promise.withResolvers()`. It lets you create a Future and hand its resolution controls to code that runs separately from the Future's internal generator — useful when you want to resolve or reject a Future imperatively in response to an external event, a callback, or a message from another thread.
+
+---
+
+## Signature
+
+```typescript
+function withResolvers<TReturn>(): FutureWithResolvers<TReturn>
+```
+
+Returns an object containing a `Future`, a `resolve` function, and a `reject` function. Calling `resolve(value)` causes the Future to resolve with that value; calling `reject(reason)` causes it to reject.
+
+Internally, `withResolvers()` creates a `Promise` using `Promise.withResolvers()` and wraps it in a `Future` via `fromPromise()`. The `resolve` and `reject` handles are forwarded directly from the underlying promise.
+
+<ResponseField name="return" type="FutureWithResolvers<TReturn>">
+  An object with three fields:
+
+  <Expandable title="FutureWithResolvers properties" defaultOpen>
+    <ResponseField name="future" type="Future<TReturn, TReturn, undefined>">
+      The Future instance. It will resolve or reject when `resolve` or `reject` is called. Both the yield type and the return type are `TReturn` — the Future yields the resolved value once and then returns it.
+    </ResponseField>
+    <ResponseField name="resolve" type="(value: TReturn | PromiseLike<TReturn>) => void">
+      Resolves the Future with `value`. Accepts a plain value or a `PromiseLike` — if a promise is passed, the Future waits for it to settle.
+    </ResponseField>
+    <ResponseField name="reject" type="(reason?: unknown) => void">
+      Rejects the Future with `reason`. The Future's `toPromise()` call (or any `await future`) will throw with this value.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## Examples
+
+### Basic timer-based resolution
+
+```typescript
+import { withResolvers } from "@okikio/future";
+
+const { future, resolve, reject } = withResolvers<string>();
+
+setTimeout(() => resolve("Hello!"), 1000);
+
+const result = await future.toPromise();
+console.log(result); // "Hello!" after 1 second
+```
+
+### Event-driven resolution
+
+`withResolvers()` is particularly useful when you need to wait for a one-time event and expose a `cancel()` handle alongside the Future.
+
+```typescript
+import { withResolvers } from "@okikio/future";
+
+function waitForUserInput(): { future: Future<string>; cancel: () => void } {
+  const { future, resolve, reject } = withResolvers<string>();
+
+  const handler = (e: Event) => {
+    resolve((e as CustomEvent).detail);
+  };
+
+  document.addEventListener("user-input", handler, { once: true });
+
+  return {
+    future,
+    cancel: () => {
+      document.removeEventListener("user-input", handler);
+      reject(new Error("Cancelled"));
+    },
+  };
+}
+
+const { future, cancel } = waitForUserInput();
+
+// Cancel if the user navigates away before providing input
+window.addEventListener("beforeunload", cancel, { once: true });
+
+const input = await future.toPromise();
+console.log("User provided:", input);
+```
+
+### Bridging a callback-based API
+
+```typescript
+import { withResolvers } from "@okikio/future";
+
+function readFileAsFuture(path: string) {
+  const { future, resolve, reject } = withResolvers<string>();
+
+  fs.readFile(path, "utf8", (err, data) => {
+    if (err) reject(err);
+    else resolve(data);
+  });
+
+  return future;
+}
+
+const content = await readFileAsFuture("./config.json").toPromise();
+console.log(content);
+```
+
+<Tip>
+  Because `withResolvers()` returns a standard `Future`, you can compose it with other Future utilities like `withDeadline()` or `withAbortable()`. For example, wrap the returned `future` with `withDeadline(future, 5000)` to ensure it always resolves within five seconds.
+</Tip>
+
+<Note>
+  `withResolvers()` does not expose a way to pause, resume, or iterate the Future with `for await...of` — it produces a single resolved value. If you need streaming output with external control, model your operation as a generator inside `new Future()` or `from()` instead.
+</Note>
+
+---
+
+## `FutureWithResolvers<TReturn>`
+
+The return type of `withResolvers()`.
+
+```typescript
+interface FutureWithResolvers<TReturn>
+  extends Omit<PromiseWithResolvers<TReturn>, "promise"> {
+  future: Future<TReturn, TReturn, undefined>;
+  resolve: (value: TReturn | PromiseLike<TReturn>) => void;
+  reject: (reason?: unknown) => void;
+}
+```
+
+This interface extends `PromiseWithResolvers<TReturn>` (omitting the `promise` field, which is replaced by `future`). The `resolve` and `reject` signatures are identical to those on the underlying promise — the Future simply wraps them.

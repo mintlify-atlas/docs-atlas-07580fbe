@@ -1,0 +1,251 @@
+---
+title: "Async generators: the engine behind Future execution"
+description: "Understand how Future uses async generator functions to enable pausable, resumable execution with push-based and pull-based workflow patterns."
+---
+
+The `Future` class uses async generator functions as its core execution primitive. Every `Future` is backed by an `AsyncGenerator` (or a synchronous `Generator`) that produces values through `yield` and completes through `return`. This design is what gives `Future` its ability to pause, resume, and cancel mid-execution — capabilities that are impossible with a plain `Promise`. Understanding how generators work inside a `Future` unlocks the full power of the library.
+
+## What is an async generator?
+
+An async generator function is declared with `async function*` and can `yield` values asynchronously. Each `yield` suspends the function and hands control back to the caller. The function resumes when the caller calls `.next()` again. When the function executes a `return` statement (or falls off the end), the generator is done.
+
+```typescript
+async function* counter() {
+  yield 1;
+  yield 2;
+  return 3; // final value, not yielded — it is the return value
+}
+
+const gen = counter();
+console.log(await gen.next()); // { value: 1, done: false }
+console.log(await gen.next()); // { value: 2, done: false }
+console.log(await gen.next()); // { value: 3, done: true }
+```
+
+The `done: true` result with `value: 3` is the `return` value of the generator, not a yielded value. This distinction matters: `for await...of` loops see only the `yield`ed values — the `return` value is ignored by the loop but captured by `Future` as the resolved value.
+
+## The FutureOperation type
+
+Every `Future` is constructed with a `FutureOperation` — a function that receives an `AbortController` and an `AsyncDisposableStack`, and returns either an `AsyncGenerator` or a synchronous `Generator`.
+
+```typescript
+interface FutureOperation<T, TReturn, TNext> {
+  (
+    abort: AbortController,
+    disposables: AsyncDisposableStack,
+  ): AsyncGenerator<T, TReturn, TNext> | Generator<T, TReturn, TNext>;
+}
+```
+
+- **`abort`** — the `AbortController` whose signal you can check inside the generator to detect cancellation.
+- **`disposables`** — an `AsyncDisposableStack` where you can register resources that will be cleaned up when the `Future` completes or is cancelled.
+
+The `from()` factory wraps your function with this signature automatically, so you rarely need to construct `FutureOperation` by hand.
+
+## How yield creates pause points
+
+Every `yield` statement inside a `FutureOperation` is a point where execution can be suspended. The `Future` wrapper — its internal `#wrapper` async generator — drives the underlying generator one step at a time by calling `generator.next()`. Between each step it checks whether the `Future` is paused or cancelled before advancing.
+
+This means:
+
+- If you call `future.pause()`, the `Future` stops calling `.next()` on the generator at the next `yield` boundary.
+- If you call `future.resume()`, the `Future` resumes calling `.next()`.
+- If you call `future.cancel()`, the abort signal fires and the wrapper throws out of the generator.
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1; // ← pause() will hold here if called before this advances
+  yield 2;
+  return 3;
+});
+
+future.pause();
+setTimeout(() => future.resume(), 1_000);
+
+for await (const value of future) {
+  console.log(value); // 1, 2 (after 1 second delay before advancing past yield 1)
+}
+```
+
+## How return produces the final value
+
+The `return` statement inside a `FutureOperation` sets the resolved value of the `Future`. When awaited with `await future` or `await future.toPromise()`, this is the value you receive.
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 42;   // intermediate value, visible in for-await loops
+  return 100; // final value, returned by toPromise()
+});
+
+console.log(await future.toPromise()); // 100
+```
+
+## Push-based workflow
+
+In a push-based workflow, the generator autonomously yields values without waiting for any external input. The consumer iterates the `Future` with `for await...of` and receives each value as it is produced.
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1;
+  yield 2;
+  yield 3;
+  return 4;
+});
+
+for await (const value of future) {
+  console.log(value); // Logs 1, 2, 3
+}
+```
+
+The `return 4` is the final resolved value. The `for await...of` loop sees only `1`, `2`, and `3` — the yielded values. To also receive the return value, use `toPromise()` after the loop, or `await future` directly.
+
+## Pull-based workflow
+
+In a pull-based workflow, the generator waits for external input before producing its next value. The consumer drives execution by calling `iterator.next(inputValue)`. The value passed to `next()` becomes the result of the `yield` expression inside the generator.
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* () {
+  let result = { value: 1, done: false };
+  while (!result.done) {
+    result = await (yield result.value);
+  }
+  return result.value;
+});
+
+const iterator = future[Symbol.asyncIterator]();
+console.log(await iterator.next());                         // { value: 1, done: false }
+console.log(await iterator.next({ value: 2, done: false })); // { value: 2, done: false }
+console.log(await iterator.next({ value: 3, done: true }));  // { value: 3, done: true }
+```
+
+<Note>
+The first call to `iterator.next()` must be called without arguments (or with `undefined`). This "primes" the generator by running it up to the first `yield`. Any value passed to the very first `next()` call is discarded by the generator runtime.
+</Note>
+
+### Push vs pull comparison
+
+<Tabs>
+  <Tab title="Push-based">
+    The generator controls the flow. Values are produced automatically and the consumer collects them passively.
+
+    ```typescript
+    const future = from(async function* () {
+      for (const item of ["a", "b", "c"]) {
+        yield item;
+      }
+      return "done";
+    });
+
+    for await (const value of future) {
+      console.log(value); // "a", "b", "c"
+    }
+    ```
+
+    Best for: data pipelines, streaming results, background producers.
+  </Tab>
+  <Tab title="Pull-based">
+    The consumer controls the flow. The generator only advances when the consumer provides the next input.
+
+    ```typescript
+    const future = from(async function* () {
+      let input: string | undefined;
+      while (input !== "stop") {
+        input = yield `echo: ${input ?? "start"}`;
+      }
+      return "finished";
+    });
+
+    const it = future[Symbol.asyncIterator]();
+    console.log(await it.next());           // { value: "echo: start", done: false }
+    console.log(await it.next("hello"));    // { value: "echo: hello", done: false }
+    console.log(await it.next("stop"));     // { value: "finished", done: true }
+    ```
+
+    Best for: bidirectional protocols, interactive pipelines, coroutines.
+  </Tab>
+</Tabs>
+
+## for await...of and Symbol.asyncIterator
+
+`Future` implements `[Symbol.asyncIterator]()`, which returns the underlying `AsyncGenerator`. This makes a `Future` directly usable in `for await...of` loops without any extra steps.
+
+```typescript
+const future = from(async function* () {
+  yield "hello";
+  yield "world";
+  return "!";
+});
+
+// These are equivalent:
+for await (const value of future) {
+  console.log(value);
+}
+
+// Same result using the iterator protocol directly:
+const iterator = future[Symbol.asyncIterator]();
+let result = await iterator.next();
+while (!result.done) {
+  console.log(result.value);
+  result = await iterator.next();
+}
+```
+
+<Warning>
+Calling `[Symbol.asyncIterator]()` on a `Future` that has been disposed (status `destroyed`) throws an error. Always check `future.is(Status.Destroyed)` before iterating if the `Future` may have been disposed.
+</Warning>
+
+## Passing values in with next()
+
+The `Future` class exposes a `next()` method that proxies directly to the underlying generator's `.next()`:
+
+```typescript
+next(...args: [] | [TNext]): PromiseLike<IteratorResult<T, T | TReturn>>
+```
+
+This is what `for await...of` uses internally, and it is also how you drive pull-based workflows manually. The generic `TNext` type on `Future<T, TReturn, TNext>` represents the type of values the generator expects to receive through `yield`.
+
+## Checking for cancellation inside a generator
+
+Your generator receives the `AbortController` as its first argument. Use `abort.signal.throwIfAborted()` to exit early if cancellation has been requested:
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* (abort) {
+  for (let i = 0; i < 1_000_000; i++) {
+    abort.signal.throwIfAborted(); // throws CancellationError if cancelled
+    yield i;
+  }
+  return "complete";
+});
+
+setTimeout(() => future.cancel(), 100);
+
+try {
+  for await (const value of future) {
+    // process values
+  }
+} catch (err) {
+  console.log(err.message); // "Future was canceled"
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Future lifecycle" href="/concepts/future-lifecycle">
+    Understand every state a Future can be in and how to transition between them
+  </Card>
+  <Card title="Cancellation" href="/concepts/cancellation">
+    How cancel(), CancellationError, and AbortSignal work together
+  </Card>
+  <Card title="Disposal" href="/concepts/disposal">
+    Register and clean up resources with AsyncDisposableStack
+  </Card>
+</CardGroup>

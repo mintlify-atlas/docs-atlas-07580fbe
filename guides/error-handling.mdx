@@ -1,0 +1,198 @@
+---
+title: "Error handling and cancellation in Future operations"
+description: "Handle errors, cancellations, and cleanup in Future using CancellationError, try/finally in generators, split(), and allSettled() for resilient async code."
+---
+
+`@okikio/future` provides structured mechanisms for handling errors and cancellations throughout an async pipeline. Errors thrown inside generators propagate naturally, cancellation is explicit and typed, and cleanup is guaranteed through generator `try/finally` blocks and the `[Symbol.asyncDispose]` protocol. Understanding these patterns lets you write async code that is both resilient and leak-free.
+
+## `CancellationError`
+
+When you call `future.cancel()` without providing a reason, the Future is aborted with a `CancellationError`. This is a distinct error class that you can detect with `instanceof`, making it straightforward to separate intentional cancellations from unexpected failures.
+
+```typescript
+import { from, CancellationError } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1;
+  return 2;
+});
+
+try {
+  future.cancel(); // aborts with CancellationError by default
+  await future.toPromise();
+} catch (e) {
+  if (e instanceof CancellationError) {
+    console.log("Future was cancelled"); // "Future was cancelled"
+  }
+}
+```
+
+`CancellationError` extends `Error` and has the fixed message `"Future was canceled"`. Its constructor takes no arguments.
+
+## Custom cancellation reasons
+
+Pass any value to `cancel()` to use a custom reason. The value is forwarded to the `AbortController`'s `abort()` call and rethrown inside the generator.
+
+```typescript
+await future.cancel(new Error("User clicked stop"));
+```
+
+You can pass any value as a reason — it does not have to be an `Error` instance. When you need to distinguish specific cancellation causes downstream, using typed errors is the clearest approach.
+
+## Errors inside generators
+
+Errors thrown inside a generator propagate out through `.toPromise()` and `for await...of` exactly as you would expect. The Future's internal machinery calls `generator.return()` to trigger cleanup before rethrowing.
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1;
+  throw new Error("Something went wrong");
+  return 2; // never reached
+});
+
+try {
+  await future.toPromise();
+} catch (e) {
+  console.error((e as Error).message); // "Something went wrong"
+}
+```
+
+## Guaranteed cleanup with `try/finally`
+
+Place cleanup logic inside a `finally` block within the generator. It runs whether the generator completes normally, throws, or is cancelled. This is the correct pattern for releasing resources like connections, file handles, or timers.
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* (abort, stack) {
+  try {
+    yield await fetchData();
+    return await processData();
+  } finally {
+    await cleanup(); // Always runs, even on cancellation
+  }
+});
+```
+
+<Note>
+  The Future calls `generator.return()` when an error or cancellation is detected. This triggers the `finally` block in the generator before the error is rethrown to the caller.
+</Note>
+
+## `[Symbol.asyncDispose]` for guaranteed cleanup
+
+`Future` implements `[Symbol.asyncDispose]`, which means you can use it with the `await using` declaration from the TC39 Explicit Resource Management proposal. The Future is cancelled and disposed when the block exits, even if an exception is thrown.
+
+```typescript
+import { from } from "@okikio/future";
+
+{
+  await using future = from(async function* () {
+    yield 1;
+    return 2;
+  });
+
+  // future.cancel() and cleanup run automatically when this block exits
+}
+```
+
+## Distinguishing cancellation from other errors
+
+Because `CancellationError` is a named class, you can branch on the type of failure rather than inspecting error messages.
+
+```typescript
+import { from, CancellationError } from "@okikio/future";
+
+const future = from(async function* () {
+  yield await riskyOperation();
+  return "success";
+});
+
+try {
+  await future.toPromise();
+} catch (e) {
+  if (e instanceof CancellationError) {
+    // Intentional cancellation — safe to ignore or log quietly
+    console.log("Operation was cancelled");
+  } else {
+    // Unexpected failure — surface to the user or retry
+    console.error("Operation failed:", e);
+  }
+}
+```
+
+## Handling mixed success and failure with `allSettled`
+
+When running multiple Futures concurrently, use `allSettled` to collect every outcome regardless of whether individual Futures succeed or fail. This prevents one bad Future from masking results from others.
+
+```typescript
+import { from, allSettled } from "@okikio/future";
+
+const futures = [
+  from(async function* () { return "ok"; }),
+  from(async function* () { throw new Error("failed"); }),
+  from(async function* () { return "also ok"; }),
+];
+
+for await (const result of allSettled(futures)) {
+  if (result.status === "fulfilled") {
+    console.log("Success:", result.value);
+  } else {
+    console.error("Error:", result.reason);
+  }
+}
+```
+
+## Splitting a Future into value and error streams with `split()`
+
+`split()` takes a single Future and returns two Futures: one that yields resolved values and one that yields errors. This is useful when you want to route successes and failures to separate handlers without try/catch at the call site.
+
+```typescript
+import { from, split } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1;
+  yield 2;
+  throw new Error("Oops");
+});
+
+const [resolvedFuture, errorFuture] = split(future);
+
+resolvedFuture.then(console.log); // Logs 1, 2
+errorFuture.catch(console.error); // Logs Error: Oops
+```
+
+<Warning>
+  `split()` tees the underlying iterator. Both returned Futures share the same source, so consuming one affects the other. Do not drive both Futures from separate concurrent loops without understanding the back-pressure implications.
+</Warning>
+
+## Summary
+
+<Tabs>
+  <Tab title="Cancellation">
+    | Scenario                        | Approach                                              |
+    | ------------------------------- | ----------------------------------------------------- |
+    | Cancel with default error       | `future.cancel()`                                     |
+    | Cancel with custom reason       | `future.cancel(new Error("reason"))`                  |
+    | Detect cancellation in catch    | `e instanceof CancellationError`                      |
+    | Auto-cancel on scope exit       | `await using future = from(...)`                      |
+  </Tab>
+  <Tab title="Error propagation">
+    | Scenario                        | Approach                                              |
+    | ------------------------------- | ----------------------------------------------------- |
+    | Throw inside generator          | Error propagates from `.toPromise()` or `for await`   |
+    | Cleanup on any exit             | `try/finally` inside the generator function           |
+    | Mixed concurrent results        | `allSettled()` to collect all `PromiseSettledResult`s |
+    | Split values from errors        | `split(future)` for separate value and error streams  |
+  </Tab>
+</Tabs>
+
+<CardGroup cols={2}>
+  <Card title="Concurrent execution" icon="arrows-split-up-and-left" href="/guides/concurrency">
+    Use `allSettled` and `withConcurrencyLimit` to safely run multiple Futures at once.
+  </Card>
+  <Card title="Streams and iterables" icon="wave-square" href="/guides/streams-and-iterables">
+    Learn how `split()` and `splitBy()` compose with stream-based Futures.
+  </Card>
+</CardGroup>

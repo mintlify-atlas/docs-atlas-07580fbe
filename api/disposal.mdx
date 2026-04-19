@@ -1,0 +1,261 @@
+---
+title: "Disposal utilities: useDisposableStack, abortable, timeout"
+description: "API reference for useDisposableStack(), abortable(), and timeout(). Register, abort, and time-limit async resources using Explicit Resource Management."
+---
+
+The disposal utilities in `@okikio/future` bring the TC39 [Explicit Resource Management](https://github.com/tc39/proposal-explicit-resource-management) proposal into async workflows. They let you register resources with a `DisposableStack` or `AsyncDisposableStack` for automatic cleanup, create abortable promises tied to an `AbortSignal`, and enforce time limits on promises that clean up after themselves. The module also re-exports polyfilled versions of `AsyncDisposableStack` and `DisposableStack` for environments that do not yet have native support.
+
+<Note>
+  Import these utilities from `@okikio/future/disposal` rather than the main entry point. The disposal module is separate to keep the core bundle lean.
+</Note>
+
+---
+
+## `AsyncDisposableStack` and `DisposableStack`
+
+The module re-exports `AsyncDisposableStack` and `DisposableStack`, preferring the native `globalThis` implementations when available and falling back to polyfills from `@nick/dispose` otherwise.
+
+```typescript
+import { AsyncDisposableStack, DisposableStack } from "@okikio/future/disposal";
+```
+
+Use these instead of importing the polyfill directly so your code automatically benefits from native implementations as they land.
+
+---
+
+## `useDisposableStack()`
+
+`useDisposableStack()` has three overloads depending on the shape of the first argument.
+
+### Overload 1 — single value
+
+```typescript
+function useDisposableStack<T>(
+  value: T,
+  stack: DisposableStack | AsyncDisposableStack,
+): T | WithDisposal<T>
+```
+
+Registers a single value with the stack. If `value` implements `Disposable` (and the stack is a `DisposableStack`) or `AsyncDisposable` (and the stack is an `AsyncDisposableStack`), it is added via `stack.use()`. Otherwise the value is returned unchanged.
+
+### Overload 2 — synchronous iterable
+
+```typescript
+function useDisposableStack<T>(
+  iterable: Iterable<T>,
+  stack: DisposableStack | AsyncDisposableStack,
+): Iterable<T | WithDisposal<T>>
+```
+
+Maps over a synchronous iterable. Each element is registered with the stack if it is disposable, then returned. Non-disposable elements pass through as-is.
+
+### Overload 3 — asynchronous iterable
+
+```typescript
+function useDisposableStack<T>(
+  iterable: AsyncIterable<T>,
+  stack: DisposableStack | AsyncDisposableStack,
+): Promise<Iterable<T | WithDisposal<T>>>
+```
+
+Maps over an asynchronous iterable using `Array.fromAsync()`. Returns a promise that resolves to an array of the processed values, each registered with the stack if disposable.
+
+<ParamField path="value" type="T | Iterable<T> | AsyncIterable<T>" required>
+  The resource or collection of resources to manage. The overload is selected automatically based on which interface the value implements.
+</ParamField>
+
+<ParamField path="stack" type="DisposableStack | AsyncDisposableStack" required>
+  The stack that manages disposal. When the stack's scope exits, all registered resources are disposed in reverse order.
+</ParamField>
+
+<ResponseField name="return" type="T | WithDisposal<T> | Iterable<T | WithDisposal<T>> | Promise<Iterable<T | WithDisposal<T>>>">
+  The value or iterable, with any disposable resources now registered on the stack.
+</ResponseField>
+
+### Examples
+
+<CodeGroup>
+
+```typescript single resource
+import { from } from "@okikio/future";
+
+const future = from(async function* (abort, stack) {
+  const connection = stack.use(new DatabaseConnection());
+  yield await connection.query("SELECT 1");
+  return await connection.query("SELECT 2");
+  // connection[Symbol.asyncDispose]() is called automatically when the Future ends
+});
+```
+
+```typescript synchronous iterable
+import { DisposableStack, useDisposableStack } from "@okikio/future/disposal";
+
+const stack = new DisposableStack();
+const resources = [new Resource1(), new Resource2()];
+
+for (const resource of useDisposableStack(resources, stack)) {
+  // Each resource is registered with the stack
+  resource.doWork();
+}
+
+stack[Symbol.dispose](); // disposes all registered resources
+```
+
+```typescript asynchronous iterable
+import { AsyncDisposableStack, useDisposableStack } from "@okikio/future/disposal";
+
+const stack = new AsyncDisposableStack();
+const asyncResources = asyncResourceGenerator();
+
+for (const resource of await useDisposableStack(asyncResources, stack)) {
+  await resource.doWork();
+}
+
+await stack[Symbol.asyncDispose]();
+```
+
+</CodeGroup>
+
+---
+
+## `abortable()`
+
+```typescript
+function abortable(
+  abort: AbortController | AbortSignal,
+): AbortablePromiseWithDisposal<void>
+```
+
+Creates a `Promise<void>` that rejects when the provided abort signal fires. If the signal is already aborted when `abortable()` is called, the promise rejects immediately. The returned object also exposes `signal`, `controller`, and both disposal symbols so it can be used inside `using` blocks or composed with other disposable resources.
+
+<ParamField path="abort" type="AbortController | AbortSignal" required>
+  The abort handle to listen to. If you pass an `AbortController`, both `signal` and `controller` properties on the return value will be populated. If you pass an `AbortSignal` directly, `controller` will be `null`.
+</ParamField>
+
+<ResponseField name="return" type="AbortablePromiseWithDisposal<void>">
+  A Promise that rejects with `signal.reason` when aborted, augmented with:
+
+  <Expandable title="additional properties">
+    <ResponseField name="signal" type="AbortSignal | null">
+      The `AbortSignal` being listened to. Set to `null` after disposal.
+    </ResponseField>
+    <ResponseField name="controller" type="AbortController | null">
+      The `AbortController`, if one was passed. `null` if an `AbortSignal` was passed directly, or after disposal.
+    </ResponseField>
+    <ResponseField name="[Symbol.dispose]()" type="void">
+      Removes the abort event listener and nulls out internal references synchronously.
+    </ResponseField>
+    <ResponseField name="[Symbol.asyncDispose]()" type="Promise<void>">
+      Async version of `[Symbol.dispose]()`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Example
+
+```typescript
+import { abortable } from "@okikio/future/disposal";
+
+const controller = new AbortController();
+const promise = abortable(controller);
+
+setTimeout(() => controller.abort(), 1000);
+
+try {
+  await promise;
+} catch (e) {
+  console.log("Aborted:", e);
+} finally {
+  promise[Symbol.dispose](); // cleans up the event listener
+}
+```
+
+<Warning>
+  Always call `[Symbol.dispose]()` or `[Symbol.asyncDispose]()` when you no longer need the abortable promise — even if it settled normally. The `"abort"` event listener is only removed automatically if the abort fires; if the operation completes before the signal aborts, you must dispose manually to prevent a listener leak.
+</Warning>
+
+---
+
+## `timeout()`
+
+```typescript
+function timeout(ms: number, options?: TimeoutOptions): PromiseWithDisposal<void>
+```
+
+Creates a `Promise<void>` that either rejects or resolves after `ms` milliseconds. By default, the promise rejects after the timeout with `new Error("Timeout exceeded")`. Pass `{ reject: false }` to resolve instead. Optionally accepts an `AbortController` or `AbortSignal` to allow early cancellation before the timer fires.
+
+The returned promise implements `[Symbol.dispose]()` and `[Symbol.asyncDispose]()`, which call `clearTimeout` to prevent timer leaks.
+
+<ParamField path="ms" type="number" required>
+  The number of milliseconds before the promise settles.
+</ParamField>
+
+<ParamField path="options" type="TimeoutOptions">
+  Optional configuration:
+
+  <Expandable title="TimeoutOptions">
+    <ResponseField name="reject" type="boolean" default="true">
+      When `true` (the default), the promise rejects with `new Error("Timeout exceeded")` after `ms`. When `false`, the promise resolves with `undefined`.
+    </ResponseField>
+    <ResponseField name="abort" type="AbortController | AbortSignal">
+      An optional abort handle. If the signal fires before `ms` elapses, the promise rejects with `signal.reason` immediately, without waiting for the timer.
+    </ResponseField>
+  </Expandable>
+</ParamField>
+
+<ResponseField name="return" type="PromiseWithDisposal<void>">
+  A `Promise<void>` that also implements `[Symbol.dispose]()` and `[Symbol.asyncDispose]()`. Disposing clears the internal `setTimeout` and, if an abort promise was created, disposes it as well.
+</ResponseField>
+
+### Examples
+
+<CodeGroup>
+
+```typescript reject on timeout (default)
+import { timeout } from "@okikio/future/disposal";
+
+const timer = timeout(5000);
+
+try {
+  await Promise.race([fetchData(), timer]);
+} catch (e) {
+  console.error("Timed out or failed:", e.message);
+} finally {
+  timer[Symbol.dispose](); // clears the timer if fetchData won
+}
+```
+
+```typescript resolve on timeout
+import { timeout } from "@okikio/future/disposal";
+
+const timer = timeout(5000, { reject: false });
+
+// Resolves after 5 seconds instead of rejecting
+await timer;
+console.log("5 seconds elapsed");
+timer[Symbol.dispose]();
+```
+
+```typescript with abort signal
+import { timeout } from "@okikio/future/disposal";
+
+const controller = new AbortController();
+const timer = timeout(5000, { abort: controller.signal });
+
+// Cancel the timer early
+setTimeout(() => controller.abort(), 1000);
+
+try {
+  await timer;
+} catch (e) {
+  console.error("Aborted before timeout:", e);
+} finally {
+  timer[Symbol.dispose]();
+}
+```
+
+</CodeGroup>
+
+<Tip>
+  Use `timeout()` with `Promise.race()` to enforce time limits on any existing promise-based API without needing to refactor the API to use Futures. For Future-based code, prefer `withDeadline()` instead — it integrates directly with the Future lifecycle and handles cleanup automatically.
+</Tip>

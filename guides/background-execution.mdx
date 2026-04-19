@@ -1,0 +1,134 @@
+---
+title: "Background execution with requestIdleCallback in Future"
+description: "Run Future operations during browser idle time with inBackground(). Keep UIs responsive while processing data-intensive tasks asynchronously."
+---
+
+`inBackground()` wraps an existing `Future` so that each step of its execution is deferred until the browser (or runtime) reports idle time via `requestIdleCallback`. The result is a new `Future` that behaves identically to the original — you still consume it with `await`, `.toPromise()`, or `for await...of` — but each iteration only advances when the main thread is free.
+
+## Basic usage
+
+```typescript
+import { from, inBackground } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1;
+  return 2;
+});
+
+const backgroundFuture = inBackground(future);
+
+// Executes during idle time
+console.log(await backgroundFuture.toPromise()); // 2
+```
+
+<Note>
+  `inBackground` wraps the existing Future — it does not change how you create the Future itself. Define your generator logic with `from()` as normal, then pass the result to `inBackground()`.
+</Note>
+
+## How it works
+
+Internally, `inBackground` drives the wrapped Future one step at a time. Before advancing the generator, it waits for an idle callback to fire. After each step completes, it schedules the next idle callback before continuing. This means every `yield` point in the original generator becomes a potential pause point where the browser can handle user input, paint frames, or run other work.
+
+<Steps>
+  <Step title="Create the underlying Future">
+    Define your async generator logic using `from()`. This Future does not run yet — Futures are lazy.
+
+    ```typescript
+    import { from } from "@okikio/future";
+
+    const processChunks = from(async function* () {
+      const data = getLargeDataset();
+      for (const chunk of data) {
+        yield processChunk(chunk);
+      }
+      return "done";
+    });
+    ```
+  </Step>
+  <Step title="Wrap it with inBackground">
+    Pass the Future to `inBackground()`. The returned Future schedules each step through `requestIdleCallback`.
+
+    ```typescript
+    import { inBackground } from "@okikio/future";
+
+    const backgroundTask = inBackground(processChunks);
+    ```
+  </Step>
+  <Step title="Consume the background Future normally">
+    Iterate or await the result exactly as you would any other Future. The idle scheduling is transparent.
+
+    ```typescript
+    for await (const result of backgroundTask) {
+      updateUI(result); // UI stays responsive between chunks
+    }
+    ```
+  </Step>
+</Steps>
+
+## Practical example: chunked data processing
+
+The pattern is especially useful when processing large datasets that can be broken into chunks. Each `yield` in the generator is a natural handoff point back to the browser.
+
+```typescript
+import { from, inBackground } from "@okikio/future";
+
+const processChunks = from(async function* () {
+  const data = getLargeDataset();
+  for (const chunk of data) {
+    yield processChunk(chunk);
+  }
+  return "done";
+});
+
+const backgroundTask = inBackground(processChunks);
+
+for await (const result of backgroundTask) {
+  updateUI(result); // UI stays responsive
+}
+```
+
+## Limitations
+
+<Warning>
+  `requestIdleCallback` is a browser API. In Node.js, Deno, and Bun, `@okikio/future` polyfills it with a `setTimeout`-based fallback. This means the idle-time guarantee only applies in browser environments.
+</Warning>
+
+- Background Futures cannot be truly "real-time" — each step requires at least one idle callback cycle, which adds latency.
+- If your generator performs synchronous CPU-heavy work between yields, that work still blocks the main thread until the next yield.
+- Long-running synchronous sections between `yield` statements will reduce the responsiveness benefit. Keep each chunk small.
+
+## Combining with `withConcurrencyLimit`
+
+<Tip>
+  Combine `inBackground` with `withConcurrencyLimit` to run a batch of background tasks while keeping concurrency bounded. Wrap the entire limited Future in `inBackground`, or wrap each individual Future before passing them to `withConcurrencyLimit`.
+</Tip>
+
+```typescript
+import { from, inBackground, withConcurrencyLimit } from "@okikio/future";
+
+const makeTask = (id: number) =>
+  inBackground(
+    from(async function* () {
+      yield `Processing item ${id}`;
+      return await heavyComputation(id);
+    })
+  );
+
+const tasks = Array.from({ length: 20 }, (_, i) => makeTask(i));
+const limited = withConcurrencyLimit(tasks, 3);
+
+for await (const progress of limited) {
+  console.log(progress); // Progress messages yielded during idle time
+}
+
+const results = await limited.toPromise();
+```
+
+<CardGroup cols={2}>
+  <Card title="Concurrent execution" icon="arrows-split-up-and-left" href="/guides/concurrency">
+    Learn all concurrency primitives: `all`, `race`, `allSettled`, `some`, and `withConcurrencyLimit`.
+  </Card>
+  <Card title="Error handling" icon="circle-exclamation" href="/guides/error-handling">
+    Handle cancellation and errors in background Futures using `CancellationError` and `try/finally`.
+  </Card>
+</CardGroup>

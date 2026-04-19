@@ -1,0 +1,389 @@
+---
+title: "from() factory functions API reference"
+description: "API reference for Future's from() function and factory helpers: fromPromise, fromIterable, fromStream, fromIterator, fromOperation, of, and is."
+---
+
+The `from()` function is the recommended way to create a `Future`. It inspects the type of its argument at runtime and dispatches to the most appropriate internal factory helper. When you know exactly what you're wrapping, you can also call those helpers directly for additional clarity or a narrower return type.
+
+<Tip>
+  If you pass an existing `Future` instance to `from()`, it is returned as-is — no wrapping occurs. This makes `from()` safe to call defensively whenever you are not sure whether you already have a `Future`.
+</Tip>
+
+---
+
+## `from()`
+
+The main factory function. Accepts any supported operation type and returns a `Future`.
+
+### Overloads
+
+```typescript
+// Generator function (most flexible — supports pause/resume/cancel natively)
+function from<T, TReturn = T, TNext = unknown>(
+  operation: FutureFromOperation<T, TReturn, TNext>
+): Future<T, TReturn, TNext>
+
+// Promise
+function from<T>(operation: PromiseLike<T>): Future<T, T>
+
+// ReadableStream
+function from<T>(operation: ReadableStream<T>): Future<T, undefined>
+
+// AsyncIterable or sync Iterable (custom iterables, not arrays/strings)
+function from<T, TReturn>(
+  operation: AsyncIterable<T> | Iterable<T | PromiseLike<T>>
+): Future<T, TReturn>
+
+// AsyncIterator or sync Iterator
+function from<T>(
+  operation: AsyncIterator<T> | Iterator<T>
+): Future<T, T>
+
+// Existing Future — returned as-is
+function from<T>(operation: Future<T, ...>): Future<T, ...>
+
+// Scalar value — wrapped with of()
+function from<T>(operation: T): Future<T, T>
+```
+
+### Dispatch order
+
+`from()` checks the argument in this order and delegates to the matching helper:
+
+1. `Future` instance → returned unchanged
+2. `ReadableStream` → `fromStream()`
+3. `PromiseLike` → `fromPromise()`
+4. `AsyncIterator` or `Iterator` → `fromIterator()`
+5. Non-builtin `AsyncIterable` or `Iterable` → `fromIterable()`
+6. Built-in `Iterable` (arrays, strings, etc.) → `fromBuiltinIterable()`
+7. `function` → `fromOperation()`
+8. Anything else → `of()`
+
+<CodeGroup>
+
+```typescript generator function
+import { from } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1;
+  yield 2;
+  return 3;
+});
+
+console.log(await future.toPromise()); // 3
+```
+
+```typescript promise
+import { from } from "@okikio/future";
+
+const future = from(Promise.resolve(42));
+console.log(await future.toPromise()); // 42
+```
+
+```typescript array
+import { from } from "@okikio/future";
+
+const future = from([1, 2, 3]);
+for await (const value of future) {
+  console.log(value); // 1, 2, 3
+}
+```
+
+```typescript ReadableStream
+import { from } from "@okikio/future";
+
+const stream = new ReadableStream<Uint8Array>({
+  pull(controller) {
+    controller.enqueue(new Uint8Array([1, 2, 3]));
+    controller.close();
+  },
+});
+
+const future = from(stream);
+for await (const chunk of future) {
+  console.log(chunk); // Uint8Array([1, 2, 3])
+}
+```
+
+</CodeGroup>
+
+---
+
+## `of(value)`
+
+```typescript
+function of<T>(value: T): Future<T, T>
+```
+
+Wraps a single scalar value in a `Future`. The Future yields the value once, then returns it as the final result.
+
+**When to use:** When you have a plain value and need a `Future` interface — for example, to compose it with other Futures in a pipeline.
+
+<ParamField path="value" type="T" required>
+  Any value to wrap. It is both yielded and returned.
+</ParamField>
+
+<ResponseField name="return" type="Future<T, T>">
+  A Future that yields `value` once and resolves to `value`.
+</ResponseField>
+
+```typescript
+import { of } from "@okikio/future";
+
+const future = of(42);
+console.log(await future.toPromise()); // 42
+```
+
+---
+
+## `fromPromise(promise)`
+
+```typescript
+function fromPromise<T>(promise: PromiseLike<T>): Future<T, T>
+```
+
+Wraps a `PromiseLike` in a `Future`. The Future yields the resolved value once, then returns it.
+
+**When to use:** When you already have a `Promise` and need cancellation, pause/resume, or iterator protocol support on top of it.
+
+<ParamField path="promise" type="PromiseLike<T>" required>
+  Any thenable — a native `Promise`, a library promise, or any object with a `.then()` method.
+</ParamField>
+
+<ResponseField name="return" type="Future<T, T>">
+  A Future that resolves to the same value the promise resolves to.
+</ResponseField>
+
+```typescript
+import { fromPromise } from "@okikio/future";
+
+const future = fromPromise(fetch("/api/data").then((r) => r.json()));
+const data = await future.toPromise();
+```
+
+---
+
+## `fromOperation(operation)`
+
+```typescript
+function fromOperation<T, TReturn = T, TNext = unknown>(
+  operation: FutureFromOperation<T, TReturn, TNext>
+): Future<T, TReturn, TNext>
+```
+
+Wraps a generator function in a `Future`. `FutureFromOperation` is a superset of `FutureOperation` — the function may return a generator, an async generator, a built-in iterable, a promise-like, or a plain value.
+
+**When to use:** When you want the full power of `AbortController` and `AsyncDisposableStack` inside a custom async generator, with maximal type safety over `T`, `TReturn`, and `TNext`.
+
+<ParamField path="operation" type="FutureFromOperation<T, TReturn, TNext>" required>
+  A function with signature `(abort: AbortController, disposables: AsyncDisposableStack) => AsyncGenerator | Generator | PromiseLike<T> | T`. The function can return any of those types and `fromOperation` dispatches accordingly.
+</ParamField>
+
+<ResponseField name="return" type="Future<T, TReturn, TNext>">
+  A Future backed by the provided generator function.
+</ResponseField>
+
+```typescript
+import { fromOperation } from "@okikio/future";
+
+const future = fromOperation(async function* (abort, stack) {
+  yield await fetchStep1(abort.signal);
+  yield await fetchStep2(abort.signal);
+  return "done";
+});
+
+for await (const step of future) {
+  console.log(step);
+}
+```
+
+---
+
+## `fromIterable(iterable)`
+
+```typescript
+function fromIterable<T, TReturn = T>(
+  iterable: AsyncIterable<T> | Iterable<T | PromiseLike<T>>
+): Future<T, TReturn>
+```
+
+Wraps a custom async or sync iterable in a `Future`. The iterable's `Symbol.asyncIterator` or `Symbol.iterator` method is consumed to drive the generator.
+
+**When to use:** When you have an object that implements the iterable protocol (not a plain array or string) and want to add cancellation and pause/resume around its iteration.
+
+<Note>
+  Built-in iterables like arrays and strings are handled by `fromBuiltinIterable()` instead. `fromIterable()` is reserved for custom iterables that do not have a direct return value.
+</Note>
+
+<ParamField path="iterable" type="AsyncIterable<T> | Iterable<T | PromiseLike<T>>" required>
+  Any object implementing `Symbol.asyncIterator` or `Symbol.iterator`.
+</ParamField>
+
+<ResponseField name="return" type="Future<T, TReturn>">
+  A Future that yields each item from the iterable in order.
+</ResponseField>
+
+```typescript
+import { fromIterable } from "@okikio/future";
+
+async function* source() {
+  yield 10;
+  yield 20;
+  yield 30;
+}
+
+const future = fromIterable(source());
+for await (const value of future) {
+  console.log(value); // 10, 20, 30
+}
+```
+
+---
+
+## `fromBuiltinIterable(iterable)`
+
+```typescript
+function fromBuiltinIterable<T>(
+  iterable: Iterable<T | PromiseLike<T>>
+): Future<T, Iterable<T | PromiseLike<T>>>
+```
+
+Wraps a built-in iterable (arrays, strings, `Set`, `Map`, etc.) in a `Future`. Unlike `fromIterable()`, this helper returns the original iterable as the final resolved value.
+
+**When to use:** When working directly with arrays or other built-in iterables and you need the original reference back as the `TReturn` value.
+
+<ParamField path="iterable" type="Iterable<T | PromiseLike<T>>" required>
+  A built-in JavaScript iterable such as `Array`, `string`, `Set`, or `Map`.
+</ParamField>
+
+<ResponseField name="return" type="Future<T, Iterable<T | PromiseLike<T>>>">
+  A Future that yields each item, then resolves to the original iterable reference.
+</ResponseField>
+
+```typescript
+import { fromBuiltinIterable } from "@okikio/future";
+
+const future = fromBuiltinIterable([1, 2, 3]);
+
+for await (const value of future) {
+  console.log(value); // 1, 2, 3
+}
+```
+
+---
+
+## `fromIterator(iterator)`
+
+```typescript
+function fromIterator<T, TReturn = T, TNext = unknown>(
+  iterator:
+    | AsyncIterator<T, TReturn, TNext>
+    | Iterator<T | PromiseLike<T>, TReturn | PromiseLike<TReturn>, TNext>
+): Future<T, TReturn>
+```
+
+Wraps a raw iterator (not an iterable) in a `Future`. Useful when you already have a consumed iterator object, not the original iterable.
+
+**When to use:** When you have called `[Symbol.asyncIterator]()` or `[Symbol.iterator]()` yourself and need to adapt the resulting raw iterator object into a Future.
+
+<ParamField path="iterator" type="AsyncIterator<T, TReturn, TNext> | Iterator<T | PromiseLike<T>, TReturn | PromiseLike<TReturn>, TNext>" required>
+  A raw iterator object with a `.next()` method.
+</ParamField>
+
+<ResponseField name="return" type="Future<T, TReturn>">
+  A Future that drives the iterator to completion, yielding each value.
+</ResponseField>
+
+```typescript
+import { fromIterator } from "@okikio/future";
+
+const arr = [10, 20, 30];
+const iterator = arr[Symbol.iterator]();
+
+const future = fromIterator(iterator);
+for await (const value of future) {
+  console.log(value); // 10, 20, 30
+}
+```
+
+---
+
+## `fromStream(stream)`
+
+```typescript
+function fromStream<T>(stream: ReadableStream<T>): Future<T, undefined>
+```
+
+Wraps a `ReadableStream` in a `Future`, yielding each chunk as it becomes available. The stream's reader is released in a `finally` block, and any read error cancels the reader before rethrowing.
+
+**When to use:** When consuming a streaming HTTP response body, a `TransformStream` output, or any Web Streams API source.
+
+<ParamField path="stream" type="ReadableStream<T>" required>
+  A Web Streams API `ReadableStream`. Commonly obtained from `Response.body` or `new ReadableStream(...)`.
+</ParamField>
+
+<ResponseField name="return" type="Future<T, undefined>">
+  A Future that yields each chunk from the stream. Resolves to `undefined` when the stream ends.
+</ResponseField>
+
+<CodeGroup>
+
+```typescript fetch response body
+import { fromStream } from "@okikio/future";
+
+const response = await fetch("https://api.example.com/large-file");
+const future = fromStream(response.body!);
+
+for await (const chunk of future) {
+  process(chunk);
+}
+```
+
+```typescript custom ReadableStream
+import { fromStream } from "@okikio/future";
+
+const stream = new ReadableStream<Uint8Array>({
+  pull(controller) {
+    controller.enqueue(new Uint8Array([1, 2, 3]));
+    controller.close();
+  },
+});
+
+const future = fromStream(stream);
+for await (const chunk of future) {
+  console.log(chunk); // Uint8Array([1, 2, 3])
+}
+```
+
+</CodeGroup>
+
+---
+
+## `is(value)`
+
+```typescript
+function is<T, TReturn = unknown, TNext = unknown>(
+  value: unknown
+): value is Future<T, TReturn, TNext>
+```
+
+Type guard that returns `true` if `value` is a `Future` instance. Uses `instanceof Future` internally.
+
+**When to use:** When you receive an unknown value and need to branch on whether it is already a `Future` before calling `from()` or other helpers.
+
+<ParamField path="value" type="unknown" required>
+  Any value to test.
+</ParamField>
+
+<ResponseField name="return" type="value is Future<T, TReturn, TNext>">
+  `true` if `value` is a `Future` instance, `false` otherwise.
+</ResponseField>
+
+```typescript
+import { is, from } from "@okikio/future";
+
+function ensureFuture<T>(input: T | Future<T>): Future<T> {
+  if (is(input)) return input;
+  return from(input);
+}
+```

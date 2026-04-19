@@ -1,97 +1,120 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Future: Cancellable Async Primitives for TypeScript"
+description: "Future is a TypeScript library that replaces Promises with cancellable, pausable, and composable async primitives built on async generators."
 ---
 
-## Setting up
+Future is a TypeScript library that brings structured concurrency and full lifecycle control to asynchronous code. Unlike native Promises, a `Future` can be paused, resumed, cancelled, composed with other Futures, and used in `for await...of` loops — all while remaining fully compatible with `await`.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get a Future running in under 5 minutes with a real working example.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Installation" icon="package" href="/installation">
+    Install via JSR, npm, or import directly in Deno, Node.js, or Bun.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Core Concepts" icon="lightbulb" href="/concepts/future-lifecycle">
+    Understand the Future lifecycle: idle, running, paused, cancelled, and completed.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/future">
+    Explore the full API surface including the Future class and all utility functions.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why Future?
 
-Everything you need to create world-class documentation.
+Native JavaScript Promises have well-known limitations: once started, they cannot be cancelled or paused. `Future` solves this with a generator-based execution model that gives you fine-grained control.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={2}>
+  <Card title="Cancellable" icon="ban">
+    Cancel any in-flight Future at any time. Cancellation propagates automatically via `AbortController`.
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Pausable" icon="pause">
+    Pause and resume execution at yield points without losing state.
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="Composable" icon="layer-group">
+    Combine Futures with `all`, `race`, `allSettled`, `scope`, and `withConcurrencyLimit`.
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="Promise-compatible" icon="check">
+    Use `await`, `.then()`, `.catch()`, and `.finally()` — Futures work wherever Promises do.
   </Card>
-</Columns>
+</CardGroup>
 
-## Need inspiration?
+## Get started in 3 steps
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Install the package">
+    Add `@okikio/future` to your project via JSR or npm.
+
+    <CodeGroup>
+    ```bash npm
+    npm install @okikio/future
+    ```
+    ```bash Deno (JSR)
+    deno add jsr:@okikio/future
+    ```
+    ```bash Bun
+    bun add @okikio/future
+    ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="Create your first Future">
+    Use `from()` to wrap an async generator function into a Future.
+
+    ```typescript
+    import { from } from "@okikio/future";
+
+    const future = from(async function* () {
+      yield 1;
+      yield 2;
+      return 3;
+    });
+
+    for await (const value of future) {
+      console.log(value); // Logs 1, 2
+    }
+    ```
+  </Step>
+
+  <Step title="Control execution">
+    Pause, resume, or cancel your Future at any point.
+
+    ```typescript
+    import { from } from "@okikio/future";
+
+    const future = from(async function* () {
+      yield 1;
+      yield 2;
+      return 3;
+    });
+
+    future.pause();
+    setTimeout(() => future.resume(), 500);
+
+    // Or cancel it entirely
+    await future.cancel();
+    ```
+  </Step>
+</Steps>
+
+## Multi-runtime support
+
+Future works across all major JavaScript runtimes with zero dependencies on runtime-specific APIs.
+
+<CardGroup cols={3}>
+  <Card title="Deno" icon="dinosaur">
+    First-class support via JSR with native TypeScript.
+  </Card>
+  <Card title="Node.js" icon="node-js">
+    Install from npm and use with any Node.js version supporting async generators.
+  </Card>
+  <Card title="Bun" icon="bolt">
+    Drop-in compatible — install from npm or JSR.
+  </Card>
+  <Card title="Cloudflare Workers" icon="cloud">
+    Runs in edge environments with no native module dependencies.
+  </Card>
+  <Card title="Browsers" icon="globe">
+    Works in modern browsers via ESM imports.
+  </Card>
+</CardGroup>

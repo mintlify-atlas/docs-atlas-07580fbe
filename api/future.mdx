@@ -1,0 +1,456 @@
+---
+title: "Future class API reference"
+description: "Complete API reference for the Future class: constructor, pause, resume, cancel, clone, toPromise, and all iterator protocol methods with TypeScript signatures."
+---
+
+The `Future` class is a cancellable, pausable alternative to JavaScript's native `Promise`. Where a Promise hands off control the moment you create it, a Future lets you suspend execution mid-flight, cancel cleanly via `AbortController`, compose with other Futures, and iterate values over time using the async iterator protocol. It implements `PromiseLike<T | TReturn>`, so you can `await` it directly or drop it into any Promise chain.
+
+<Note>
+  A `Future` also implements `Symbol.asyncDispose`, which means you can manage its lifecycle with `await using` in environments that support the TC39 Explicit Resource Management proposal.
+</Note>
+
+---
+
+## Constructor
+
+```typescript
+new Future<T, TReturn = unknown, TNext = unknown>(
+  operation: FutureOperation<T, TReturn, TNext>,
+  abort?: AbortController | null
+)
+```
+
+Creates a new `Future` instance and immediately initializes the internal async generator wrapper. The generator does not begin executing until you call `next()`, iterate with `for await...of`, or call `toPromise()`.
+
+<ParamField path="operation" type="FutureOperation<T, TReturn, TNext>" required>
+  A function with the signature `(abort: AbortController, disposables: AsyncDisposableStack) => AsyncGenerator<T, TReturn, TNext> | Generator<T, TReturn, TNext>`. It defines the async work the Future will perform. Use `abort` to respond to cancellation and `disposables` to register cleanup callbacks.
+</ParamField>
+
+<ParamField path="abort" type="AbortController | null">
+  An optional `AbortController` used to signal cancellation. Defaults to `new AbortController()` if omitted. Pass `null` to create a Future with no external cancellation handle.
+</ParamField>
+
+```typescript
+import { Future } from "@okikio/future";
+
+const future = new Future<number>(async function* (abort, stack) {
+  yield 1;
+  yield 2;
+  return 3;
+});
+
+console.log(await future.toPromise()); // 3
+```
+
+---
+
+## Type parameters
+
+<ResponseField name="T" type="type parameter">
+  The type of each yielded value.
+</ResponseField>
+
+<ResponseField name="TReturn" type="type parameter">
+  The type of the final return value. Defaults to `unknown`.
+</ResponseField>
+
+<ResponseField name="TNext" type="type parameter">
+  The type of values sent back into the generator via `next(value)`. Defaults to `unknown`.
+</ResponseField>
+
+---
+
+## Lifecycle methods
+
+### `pause()`
+
+```typescript
+pause(): Future<T, TReturn, TNext>
+```
+
+Suspends execution at the next `yield` point. If the Future is already paused, this is a no-op. Returns `this` for chaining.
+
+```typescript
+future.pause();
+setTimeout(() => future.resume(), 1000);
+
+for await (const value of future) {
+  console.log(value); // values are delayed by 1 second before starting
+}
+```
+
+---
+
+### `resume()`
+
+```typescript
+resume(): Future<T, TReturn, TNext>
+```
+
+Resumes a paused Future by transitioning its status from `"paused"` back to `"running"`. If the Future is not currently paused, this is a no-op. Returns `this` for chaining.
+
+```typescript
+future.pause();
+future.resume(); // back to running immediately
+```
+
+---
+
+### `reset()`
+
+```typescript
+reset(): Future<T, TReturn, TNext>
+```
+
+Resets the Future to `"idle"` so it can run again from the beginning. You can only call `reset()` after the Future has reached `"completed"` or `"cancelled"` status.
+
+<Warning>
+  Calling `reset()` on a Future that is still running or has been destroyed throws an `Error`. Check `future.is(Status.Completed)` or `future.is(Status.Cancelled)` before calling this method.
+</Warning>
+
+```typescript
+await future.toPromise(); // completes the future
+future.reset();           // ready to run again
+console.log(await future.toPromise()); // runs from scratch
+```
+
+---
+
+### `complete(value)`
+
+```typescript
+complete(value: T | TReturn | undefined): Future<T, TReturn, TNext>
+```
+
+Manually marks the Future as completed with the given value. This triggers a `"completed"` status event and causes the internal generator to return early via `generator.return(value)`.
+
+<ParamField path="value" type="T | TReturn | undefined" required>
+  The value to resolve the Future with.
+</ParamField>
+
+```typescript
+future.complete(42); // future resolves to 42 immediately
+```
+
+---
+
+### `cancel(reason?)`
+
+```typescript
+async cancel(reason?: unknown): Promise<StatusEvent | Error | undefined>
+```
+
+Asynchronously cancels the Future by calling `abort.abort(reason)` on the internal `AbortController`. Waits for the `"cancelled"` status event before resolving, with a built-in timeout guard.
+
+<ParamField path="reason" type="unknown">
+  The cancellation reason. Defaults to a `CancellationError` instance if omitted.
+</ParamField>
+
+<ResponseField name="return" type="Promise<StatusEvent | Error | undefined>">
+  Resolves to the `StatusEvent` emitted when cancellation completes, or `undefined` if it times out.
+</ResponseField>
+
+```typescript
+const future = from(async function* () {
+  yield 1;
+  yield 2;
+  return 3;
+});
+
+await future.cancel("user requested stop");
+```
+
+---
+
+### `dispose()`
+
+```typescript
+async dispose(): Promise<void>
+```
+
+Performs a full teardown of the Future: cancels execution, drains the `AsyncDisposableStack`, removes all event listeners, and nulls out all internal references. After `dispose()` completes, the Future's status is `"destroyed"`.
+
+<Warning>
+  A disposed Future cannot be used again. Calling `[Symbol.asyncIterator]()` on a destroyed Future throws `"Cannot iterate over a destroyed future"`. There is no recovery — you must create a new Future or use `clone()` before disposing.
+</Warning>
+
+```typescript
+await future.dispose();
+// future.getStatus() === "destroyed"
+```
+
+---
+
+### `[Symbol.asyncDispose]()`
+
+```typescript
+[Symbol.asyncDispose](): Promise<void>
+```
+
+Alias for `dispose()`. Enables the `await using` syntax from the TC39 Explicit Resource Management proposal.
+
+```typescript
+{
+  await using future = from(async function* () {
+    yield 1;
+    return 2;
+  });
+
+  console.log(await future.toPromise()); // 2
+} // dispose() is called automatically here
+```
+
+---
+
+## Status methods
+
+### `is(id)`
+
+```typescript
+is(id: StatusEnum): boolean
+```
+
+Returns `true` if the Future's current status matches `id`.
+
+<ParamField path="id" type="StatusEnum" required>
+  One of `"idle"`, `"running"`, `"paused"`, `"completed"`, `"cancelled"`, or `"destroyed"`. Use the `Status` constant object to avoid raw strings.
+</ParamField>
+
+```typescript
+import { Status } from "@okikio/future";
+
+if (future.is(Status.Paused)) {
+  future.resume();
+}
+```
+
+---
+
+### `getStatus()`
+
+```typescript
+getStatus(): StatusEnum
+```
+
+Returns the Future's current status as a string literal.
+
+```typescript
+const status = future.getStatus();
+console.log(status); // "idle" | "running" | "paused" | "completed" | "cancelled" | "destroyed"
+```
+
+---
+
+## Iterator protocol methods
+
+The `Future` class implements the full async iterator protocol. You can consume it directly in `for await...of` loops or drive it manually via `next()`, `return()`, and `throw()`.
+
+### `[Symbol.asyncIterator]()`
+
+```typescript
+[Symbol.asyncIterator](): AsyncGenerator<T, T | TReturn, TNext>
+```
+
+Returns the internal async generator. This is called implicitly by `for await...of` loops.
+
+<Warning>
+  Calling `[Symbol.asyncIterator]()` on a destroyed Future throws `"Cannot iterate over a destroyed future"`. Dispose a Future only when you are completely finished with it.
+</Warning>
+
+<CodeGroup>
+
+```typescript push-based
+import { from } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1;
+  yield 2;
+  yield 3;
+  return 4;
+});
+
+for await (const value of future) {
+  console.log(value); // 1, 2, 3
+}
+```
+
+```typescript pull-based
+import { from } from "@okikio/future";
+
+const future = from(async function* () {
+  let result = { value: 1, done: false };
+  while (!result.done) {
+    result = await (yield result.value);
+  }
+  return result.value;
+});
+
+const iterator = future[Symbol.asyncIterator]();
+console.log(await iterator.next());                        // { value: 1, done: false }
+console.log(await iterator.next({ value: 2, done: false })); // { value: 2, done: false }
+console.log(await iterator.next({ value: 3, done: true }));  // { value: 3, done: true }
+```
+
+</CodeGroup>
+
+---
+
+### `next(...args)`
+
+```typescript
+next(...args: [] | [TNext]): PromiseLike<IteratorResult<T, T | TReturn>>
+```
+
+Advances the internal generator to the next `yield`. Optionally sends a value back into the generator as the result of the current `yield` expression (pull-based pattern).
+
+<ParamField path="args" type="[] | [TNext]">
+  An optional value to send into the generator. In a pull-based workflow, the generator receives this as the resolved value of `await (yield ...)`.
+</ParamField>
+
+<ResponseField name="return" type="PromiseLike<IteratorResult<T, T | TReturn>>">
+  Resolves to `{ value: T, done: false }` for yielded values or `{ value: T | TReturn, done: true }` when the generator finishes.
+</ResponseField>
+
+---
+
+### `return(value?)`
+
+```typescript
+return(value?: T | TReturn | PromiseLike<T | TReturn>): PromiseLike<IteratorResult<T, T | TReturn>>
+```
+
+Forces the generator to return early with the given value, triggering any `finally` blocks inside the generator.
+
+<ParamField path="value" type="T | TReturn | PromiseLike<T | TReturn>">
+  The value to return. If omitted, the generator returns `undefined`.
+</ParamField>
+
+---
+
+### `throw(e)`
+
+```typescript
+throw(e: unknown): PromiseLike<IteratorResult<T, T | TReturn>>
+```
+
+Injects an error into the generator at its current suspension point. The generator can catch this inside a `try/catch` or let it propagate.
+
+<ParamField path="e" type="unknown" required>
+  The error value to throw into the generator.
+</ParamField>
+
+---
+
+## Utility methods
+
+### `clone()`
+
+```typescript
+clone(): Future<T, TReturn, TNext>
+```
+
+Creates a new `Future` instance backed by the same `operation` function. The clone starts in `"idle"` status and runs completely independently from the original.
+
+<Warning>
+  Calling `clone()` on a destroyed Future throws `"Cannot clone a Future without an operation."`. Clone before disposing if you need a copy.
+</Warning>
+
+```typescript
+import { from } from "@okikio/future";
+
+const original = from(async function* () {
+  yield 1;
+  return 2;
+});
+
+const copy = original.clone();
+console.log(await copy.toPromise()); // 2 — independent run
+```
+
+---
+
+### `toPromise()`
+
+```typescript
+async toPromise(): Promise<T | TReturn>
+```
+
+Drives the Future to completion by calling `next()` in a loop until `done` is `true`, then returns the final value. If the Future was already completed and has a cached resolved value, it returns that immediately without re-running.
+
+<ResponseField name="return" type="Promise<T | TReturn>">
+  The final return value of the generator. If the generator has no explicit `return` statement, this resolves to `undefined`.
+</ResponseField>
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 42;
+  return 100;
+});
+
+const result = await future.toPromise(); // 100
+```
+
+---
+
+## Promise-compatible methods
+
+Because `Future` implements `PromiseLike`, you can use `await`, `.then()`, `.catch()`, and `.finally()` directly. All three delegate to `toPromise()` internally.
+
+### `then(onfulfilled?, onrejected?)`
+
+```typescript
+then<TResult1 = T | TReturn, TResult2 = never>(
+  onfulfilled?: ((value: T | TReturn) => TResult1 | PromiseLike<TResult1>) | null,
+  onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+): Promise<TResult1 | TResult2>
+```
+
+<ParamField path="onfulfilled" type="((value: T | TReturn) => TResult1 | PromiseLike<TResult1>) | null">
+  Called when the Future resolves successfully.
+</ParamField>
+
+<ParamField path="onrejected" type="((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null">
+  Called when the Future rejects.
+</ParamField>
+
+---
+
+### `catch(onrejected?)`
+
+```typescript
+catch<TResult = never>(
+  onrejected?: ((reason: unknown) => TResult | PromiseLike<TResult>) | null,
+): Promise<T | TReturn | TResult>
+```
+
+<ParamField path="onrejected" type="((reason: unknown) => TResult | PromiseLike<TResult>) | null">
+  Called when the Future rejects with an error.
+</ParamField>
+
+---
+
+### `finally(onfinally?)`
+
+```typescript
+finally(onfinally?: (() => void) | null): Promise<T | TReturn>
+```
+
+<ParamField path="onfinally" type="(() => void) | null">
+  Called when the Future settles, whether it resolved or rejected. The return value is ignored and the original resolved value is passed through.
+</ParamField>
+
+```typescript
+import { from } from "@okikio/future";
+
+const result = await from(async function* () {
+  yield 1;
+  return 2;
+})
+  .then((v) => v * 10)
+  .catch((err) => console.error(err))
+  .finally(() => console.log("done")); // "done"
+
+console.log(result); // 20
+```

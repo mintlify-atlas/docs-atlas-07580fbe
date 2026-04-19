@@ -1,0 +1,152 @@
+---
+title: "race() API reference — first settled Future wins"
+description: "API reference for Future's race() function. Returns the result of the first Future or Promise to settle, similar to Promise.race. Includes examples."
+---
+
+`race()` returns a `Future` that resolves or rejects with the outcome of whichever input future settles first. It is the structured-concurrency equivalent of `Promise.race`, extended to work natively with `Future`'s generator-based execution model and disposable lifecycle.
+
+## Signature
+
+```typescript
+function race<T, TReturn, TNext>(
+  futures: Iterable<Future<T, TReturn, TNext> | PromiseLike<T | TReturn>>,
+): Future<T | TReturn, T | TReturn, TNext>
+```
+
+## Parameters
+
+<ParamField path="futures" type="Iterable<Future<T, TReturn, TNext> | PromiseLike<T | TReturn>>" required>
+  An iterable of `Future` instances or `PromiseLike` objects. The first to settle wins; all others continue running in the background but their results are discarded.
+</ParamField>
+
+## Return value
+
+<ResponseField name="return" type="Future<T | TReturn, T | TReturn, TNext>">
+  A `Future` that yields and returns the result of the first input to settle. If the winning future rejects, the returned `Future` rejects with the same reason.
+</ResponseField>
+
+<Note>
+  The losing futures are not automatically cancelled. They continue to run and are disposed when the returned `Future`'s `AsyncDisposableStack` is cleaned up. If you need explicit cancellation of losers, cancel them manually after `race()` settles.
+</Note>
+
+## Example
+
+### Basic race between two futures
+
+```typescript
+import { from, race } from "@okikio/future";
+
+const slow = from(async function* () {
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  return "slow";
+});
+
+const fast = from(async function* () {
+  await new Promise(resolve => setTimeout(resolve, 100));
+  return "fast";
+});
+
+const winner = await race([slow, fast]).toPromise();
+console.log(winner); // "fast"
+```
+
+### Race with iterating yielded values
+
+```typescript
+import { from, race } from "@okikio/future";
+
+const a = from(async function* () {
+  yield "a-intermediate";
+  return "a-final";
+});
+
+const b = from(async function* () {
+  await new Promise(resolve => setTimeout(resolve, 50));
+  yield "b-intermediate";
+  return "b-final";
+});
+
+for await (const value of race([a, b])) {
+  // The winning future's yielded value is surfaced here
+  console.log(value);
+}
+```
+
+### Racing a network request against a deadline
+
+A common pattern is to race a `Future` representing a network operation against a timeout future. If the request does not complete within the deadline, the timeout future settles first.
+
+```typescript
+import { from, race } from "@okikio/future";
+
+const request = from(async function* () {
+  const response = await fetch("https://api.example.com/data");
+  return await response.json();
+});
+
+const timeout = from(async function* () {
+  await new Promise((_, reject) =>
+    setTimeout(() => reject(new Error("Request timed out after 5s")), 5000)
+  );
+});
+
+try {
+  const result = await race([request, timeout]).toPromise();
+  console.log(result);
+} catch (err) {
+  console.error(err.message); // "Request timed out after 5s"
+}
+```
+
+<Tip>
+  If your project uses a dedicated deadline utility, you can wrap it as a `Future` and pass it as one of the inputs to `race()`. This keeps timeout logic composable and reusable without coupling it to individual request futures.
+</Tip>
+
+## Behavior details
+
+<Tabs>
+  <Tab title="Fulfillment">
+    When the first future fulfills, `race()` yields that value and returns it. The returned `Future` completes with `{ value, done: true }`.
+
+    ```typescript
+    const result = await race([
+      from(async function* () { return 42; }),
+      from(async function* () {
+        await new Promise(r => setTimeout(r, 500));
+        return 99;
+      }),
+    ]).toPromise();
+
+    console.log(result); // 42 — the first future resolved immediately
+    ```
+  </Tab>
+  <Tab title="Rejection">
+    If the first future to settle rejects, `race()` rejects with the same error. Use a `try/catch` block or `.catch()` to handle it.
+
+    ```typescript
+    try {
+      await race([
+        from(async function* () { throw new Error("first failed"); }),
+        from(async function* () {
+          await new Promise(r => setTimeout(r, 1000));
+          return "too late";
+        }),
+      ]).toPromise();
+    } catch (err) {
+      console.error(err.message); // "first failed"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Comparison with `Promise.race`
+
+`race()` is intentionally analogous to `Promise.race` but operates on `Future` objects:
+
+| Feature | `Promise.race` | `Future race()` |
+|---|---|---|
+| Input type | `Promise[]` | `Iterable<Future \| PromiseLike>` |
+| First-settler wins | Yes | Yes |
+| Cancels losers | No | No (losers are disposed via stack) |
+| Yields intermediate values | No | Yes |
+| Works with `for await...of` | No | Yes |

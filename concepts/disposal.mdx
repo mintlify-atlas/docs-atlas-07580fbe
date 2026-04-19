@@ -1,0 +1,279 @@
+---
+title: "Resource disposal and cleanup in Future"
+description: "Future supports Explicit Resource Management (using/await using). Learn how Symbol.asyncDispose, AsyncDisposableStack, and DualDisposable work together."
+---
+
+`@okikio/future` is built around the TC39 [Explicit Resource Management](https://github.com/tc39/proposal-explicit-resource-management) proposal, which introduces `using` and `await using` syntax for deterministic, scope-bound cleanup of resources. Every `Future` implements `[Symbol.asyncDispose]()`, and the library provides utilities — `AsyncDisposableStack`, `useDisposableStack`, `abortable`, and `timeout` — that make it straightforward to tie resource lifetimes to the execution of a `Future`. This page explains how all of these pieces fit together.
+
+## Explicit Resource Management
+
+The TC39 Explicit Resource Management proposal adds two new declaration forms to JavaScript:
+
+- `using resource = expr` — calls `resource[Symbol.dispose]()` synchronously when the block exits.
+- `await using resource = expr` — calls `await resource[Symbol.asyncDispose]()` asynchronously when the block exits.
+
+These declarations work like `try/finally` blocks, guaranteeing cleanup even if an exception is thrown. TypeScript 5.2+ and modern runtimes include native support; `@okikio/future` also ships polyfills via `@nick/dispose` for environments that do not yet have built-in support.
+
+```typescript
+// Synchronous disposal
+{
+  using conn = openDatabaseConnection();
+  // conn[Symbol.dispose]() is called automatically here
+}
+
+// Asynchronous disposal
+{
+  await using conn = openDatabaseConnection();
+  // conn[Symbol.asyncDispose]() is called automatically here
+}
+```
+
+## Future implements Symbol.asyncDispose
+
+`Future` implements `[Symbol.asyncDispose]()`, which delegates directly to its `dispose()` method. `dispose()` cancels the `Future`, disposes all resources registered on the internal `AsyncDisposableStack`, and sets the status to `destroyed`.
+
+```typescript
+[Symbol.asyncDispose](): Promise<void> {
+  return this.dispose();
+}
+```
+
+This makes `Future` directly usable with `await using`:
+
+```typescript
+import { from } from "@okikio/future";
+
+async function runTask() {
+  await using future = from(async function* () {
+    yield 1;
+    return 2;
+  });
+
+  console.log(await future.toPromise()); // 2
+  // future.dispose() is called automatically when the block exits,
+  // even if an error was thrown above
+}
+```
+
+<Note>
+After `dispose()` returns, the `Future` is in the `destroyed` state. Calling `[Symbol.asyncIterator]()` or `reset()` on a destroyed `Future` throws an error.
+</Note>
+
+## The DualDisposable interface
+
+`DualDisposable` is an interface that combines both `Disposable` and `AsyncDisposable`. Objects that implement it support both synchronous cleanup (via `Symbol.dispose`) and asynchronous cleanup (via `Symbol.asyncDispose`), making them compatible with both `using` and `await using`.
+
+```typescript
+export interface DualDisposable extends Disposable, AsyncDisposable {}
+```
+
+You can implement `DualDisposable` for your own resource types to make them work seamlessly with `DisposableStack`, `AsyncDisposableStack`, and `useDisposableStack`:
+
+```typescript
+class MyResource implements DualDisposable {
+  [Symbol.dispose]() {
+    // Synchronous cleanup — close handles, release locks, etc.
+  }
+
+  async [Symbol.asyncDispose]() {
+    // Asynchronous cleanup — flush buffers, close network connections, etc.
+    await this.flush();
+  }
+}
+```
+
+## AsyncDisposableStack
+
+`AsyncDisposableStack` is a stack-based resource manager. Resources are registered with `.use()` and disposed in LIFO (last-in, first-out) order when the stack's `disposeAsync()` method is called. It also supports `await using` directly.
+
+`Future` creates an `AsyncDisposableStack` internally for every instance and passes it as the second argument to your `FutureOperation`. Resources registered on this stack are disposed when the `Future` completes, is cancelled, or is destroyed.
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* (abort, stack) {
+  // Register a resource — it will be disposed when the Future ends
+  const resource = stack.use(new MyResource());
+
+  yield resource.getValue();
+  return resource.getFinal();
+});
+```
+
+You can also use `AsyncDisposableStack` standalone:
+
+```typescript
+import { AsyncDisposableStack } from "@okikio/future";
+
+await using stack = new AsyncDisposableStack();
+
+const conn = stack.use(openConnection());
+const cache = stack.use(openCache());
+
+// Both conn and cache are disposed automatically when the block exits
+```
+
+## useDisposableStack
+
+`useDisposableStack(value, stack)` registers a single value, a synchronous iterable, or an asynchronous iterable with a `DisposableStack` or `AsyncDisposableStack`. Resources that implement `Disposable` or `AsyncDisposable` are enrolled in the stack for automatic cleanup; non-disposable values pass through unchanged.
+
+```typescript
+export function useDisposableStack<T>(value: T, stack: DisposableStack | AsyncDisposableStack): T | WithDisposal<T>;
+export function useDisposableStack<T>(iterable: Iterable<T>, stack: DisposableStack | AsyncDisposableStack): Iterable<T | WithDisposal<T>>;
+export function useDisposableStack<T>(iterable: AsyncIterable<T>, stack: DisposableStack | AsyncDisposableStack): Promise<Iterable<T | WithDisposal<T>>>;
+```
+
+This is particularly useful inside a `FutureOperation` when you receive a resource and want to ensure it is cleaned up regardless of whether the `Future` completes normally or is cancelled:
+
+```typescript
+import { from } from "@okikio/future";
+import { useDisposableStack } from "@okikio/future";
+
+const future = from(async function* (abort, stack) {
+  // Enroll an array of resources; each disposable one is managed by `stack`
+  const resources = [new ResourceA(), new ResourceB()];
+  for (const resource of useDisposableStack(resources, stack)) {
+    yield resource.read();
+  }
+  return "done";
+});
+```
+
+## abortable
+
+`abortable(abort)` creates a promise that rejects when the provided `AbortController` or `AbortSignal` fires, and implements both `Symbol.dispose` and `Symbol.asyncDispose` for cleanup.
+
+```typescript
+export function abortable(abort: AbortController | AbortSignal): AbortablePromiseWithDisposal<void>
+```
+
+```typescript
+import { abortable } from "@okikio/future";
+
+const controller = new AbortController();
+using abortPromise = abortable(controller);
+
+setTimeout(() => controller.abort(), 1_000);
+
+try {
+  await abortPromise;
+} catch (err) {
+  console.error("Aborted:", err);
+}
+// abortPromise[Symbol.dispose]() is called automatically — removes the abort listener
+```
+
+`abortable` is used internally by `Future`'s `#getNextResult` method to race generator steps against cancellation events.
+
+## timeout
+
+`timeout(ms, options?)` creates a promise that either resolves or rejects after a given number of milliseconds, and also implements `Symbol.dispose` / `Symbol.asyncDispose` to clear the timer when it is no longer needed.
+
+```typescript
+export function timeout(ms: number, options?: TimeoutOptions): PromiseWithDisposal<void>
+```
+
+```typescript
+import { timeout } from "@okikio/future";
+
+// Reject after 5 seconds (default)
+{
+  using t = timeout(5_000);
+  await Promise.race([myOperation(), t]);
+  // t[Symbol.dispose]() clears the timer
+}
+
+// Resolve after 5 seconds
+{
+  using t = timeout(5_000, { reject: false });
+  await Promise.race([myOperation(), t]);
+}
+
+// Combine with an AbortSignal for early cancellation
+const controller = new AbortController();
+{
+  using t = timeout(5_000, { abort: controller.signal });
+  await t; // resolves/rejects after 5 s, or immediately if signal fires
+}
+```
+
+<Note>
+`GENERATOR_RETURN_TIMEOUT` — the 1 000 ms budget given to `generator.return()` during cancellation — is implemented internally using `timeout`. This is why keeping `finally` block cleanup fast matters.
+</Note>
+
+## Registering resources inside a FutureOperation
+
+The recommended pattern is to register all resources you need inside the `FutureOperation` via the `stack` parameter. This ensures they are disposed in the correct order regardless of how the `Future` ends.
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* (abort, stack) {
+  // Resources registered here are disposed when the Future ends
+  const resource = stack.use(new MyResource());
+
+  yield resource.getValue();
+  return resource.getFinal();
+});
+
+await future.toPromise();
+// MyResource is disposed automatically
+```
+
+<Steps>
+  <Step title="FutureOperation runs">
+    Your generator function is called with `abort` and `stack`. Resources you register via `stack.use()` are added to the disposal stack.
+  </Step>
+  <Step title="Future completes or is cancelled">
+    When the generator finishes (return) or is aborted (cancel), the `Future`'s `dispose()` method is eventually called.
+  </Step>
+  <Step title="AsyncDisposableStack.disposeAsync() runs">
+    All registered resources are disposed in LIFO order, with `[Symbol.asyncDispose]()` called on each async-disposable resource.
+  </Step>
+</Steps>
+
+## Full example with await using
+
+```typescript
+import { from } from "@okikio/future";
+
+class DatabaseConnection implements DualDisposable {
+  async query(sql: string) { /* ... */ }
+
+  [Symbol.dispose]() { /* sync close */ }
+  async [Symbol.asyncDispose]() { /* async flush + close */ }
+}
+
+async function processRecords() {
+  await using future = from(async function* (abort, stack) {
+    const db = stack.use(new DatabaseConnection());
+
+    const rows = await db.query("SELECT * FROM records");
+    for (const row of rows) {
+      abort.signal.throwIfAborted();
+      yield processRow(row);
+    }
+    return "complete";
+  });
+
+  for await (const result of future) {
+    console.log(result);
+  }
+  // When the block exits:
+  // 1. future.dispose() is called
+  // 2. future.cancel() runs (no-op since already complete)
+  // 3. AsyncDisposableStack disposes DatabaseConnection
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Future lifecycle" href="/concepts/future-lifecycle">
+    All six states and how dispose() relates to the destroyed state
+  </Card>
+  <Card title="Async generators" href="/concepts/async-generators">
+    How the stack parameter is passed into your FutureOperation
+  </Card>
+  <Card title="Cancellation" href="/concepts/cancellation">
+    How cancel() and disposal interact during cleanup
+  </Card>
+</CardGroup>

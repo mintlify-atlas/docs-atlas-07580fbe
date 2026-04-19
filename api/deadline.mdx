@@ -1,0 +1,136 @@
+---
+title: "withDeadline() and delay() — Future timeout API reference"
+description: "API reference for withDeadline() and delay(). Set time limits on async Futures or create timer-based Futures with built-in cancellation support."
+---
+
+The deadline utilities give you two complementary tools for time-based Future control: `withDeadline()` wraps any existing Future so that it cancels itself if it runs too long, while `delay()` creates a new Future that resolves after a fixed wait. Both utilities respect cancellation — if the Future is cancelled before the timer fires, the underlying `setTimeout` is cleared and no stale callbacks remain.
+
+---
+
+## `withDeadline()`
+
+```typescript
+function withDeadline<T, TReturn, TNext>(
+  future: Future<T, TReturn, TNext>,
+  ms: number,
+): Future<T | TReturn, T | TReturn, TNext>
+```
+
+Wraps a Future with a deadline. A `setTimeout` starts when the returned Future begins executing. If the original Future does not complete within `ms` milliseconds, it is cancelled with `new Error("Future timed out")`. If the Future finishes before the deadline, the timeout is cleared in the `finally` block — no timer leaks.
+
+The original `future` is registered with the internal `AsyncDisposableStack`, so it is disposed automatically when the deadline Future is disposed.
+
+<ParamField path="future" type="Future<T, TReturn, TNext>" required>
+  The Future to enforce a deadline on. Its type parameters flow through to the returned Future.
+</ParamField>
+
+<ParamField path="ms" type="number" required>
+  The number of milliseconds before the Future is automatically cancelled. The clock starts when the returned Future's generator begins executing, not when `withDeadline()` is called.
+</ParamField>
+
+<ResponseField name="return" type="Future<T | TReturn, T | TReturn, TNext>">
+  A new Future that delegates to the original but cancels it if `ms` elapses. The union type `T | TReturn` reflects that either a yielded value or the return value may propagate from the inner generator.
+</ResponseField>
+
+<Warning>
+  When the deadline fires, `cancel()` is called with `new Error("Future timed out")`. The outer Future will reject with this error. Wrap `toPromise()` in a `try/catch` to handle timeouts gracefully.
+</Warning>
+
+### Example
+
+```typescript
+import { from, withDeadline } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 42;
+  return 100;
+});
+
+const deadlineFuture = withDeadline(future, 1000); // 1-second deadline
+
+try {
+  const result = await deadlineFuture.toPromise();
+  console.log(result); // 100, if it completes in time
+} catch (e) {
+  console.error("Timed out:", e.message); // "Future timed out"
+}
+```
+
+---
+
+## `delay()`
+
+```typescript
+function delay<T = unknown>(ms: number, value?: T): Future<T, T>
+```
+
+Creates a Future that resolves after `ms` milliseconds, optionally yielding a value. The timer is set up inside the Future's generator, so it only starts when you begin consuming the Future (via `toPromise()`, `for await...of`, or `next()`). If the Future is cancelled before the timeout fires, `clearTimeout` is called in the `finally` block.
+
+<ParamField path="ms" type="number" required>
+  The number of milliseconds to wait before the Future resolves.
+</ParamField>
+
+<ParamField path="value" type="T">
+  An optional value the Future yields and returns after the delay. Defaults to `undefined`. The type parameter `T` is inferred from this argument.
+</ParamField>
+
+<ResponseField name="return" type="Future<T, T>">
+  A Future that yields `value` once after `ms` milliseconds and then returns the same value. Both the yield type and the return type are `T`.
+</ResponseField>
+
+<Note>
+  `delay()` calls `abort.signal.throwIfAborted()` before awaiting the timer promise, so if the Future is already cancelled at the moment it starts, it rejects immediately without setting a timer.
+</Note>
+
+### Basic usage
+
+```typescript
+import { delay } from "@okikio/future";
+
+const result = await delay(1000, "Hello, world!").toPromise();
+console.log(result); // "Hello, world!" after 1 second
+```
+
+### Combining with other Futures
+
+<CodeGroup>
+
+```typescript race against a delay
+import { from, delay, race } from "@okikio/future";
+
+const operation = from(async function* () {
+  const data = await fetchData();
+  return data;
+});
+
+// Race: whichever settles first wins
+const result = await race([
+  operation,
+  delay(5000, null), // fallback after 5 seconds
+]).toPromise();
+
+if (result === null) {
+  console.log("Timed out — fallback value returned");
+}
+```
+
+```typescript sequential delay
+import { from, delay } from "@okikio/future";
+
+const pipeline = from(async function* () {
+  yield "starting...";
+  await delay(500).toPromise(); // pause for 500ms mid-pipeline
+  yield "resuming after delay";
+  return "done";
+});
+
+for await (const msg of pipeline) {
+  console.log(msg);
+}
+```
+
+</CodeGroup>
+
+<Tip>
+  Prefer `withDeadline()` when you want to enforce a time limit on existing async work. Use `delay()` when you need a timer as a first-class Future — for example, as a race condition fallback or to introduce a deliberate pause in a pipeline.
+</Tip>

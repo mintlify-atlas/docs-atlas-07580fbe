@@ -1,0 +1,229 @@
+---
+title: "Cancelling async operations with Future"
+description: "Learn how to cancel a Future at any point using cancel(), link external AbortSignals, and handle CancellationError in your async workflows."
+---
+
+One of the most important advantages `Future` has over a plain `Promise` is the ability to cancel an in-flight operation at any point. Cancellation in `@okikio/future` is built on top of the standard `AbortController` API, which means it integrates naturally with browser APIs, `fetch`, and any other code that already respects `AbortSignal`. This page explains how cancellation works end-to-end, from calling `cancel()` to handling the resulting error inside your generator.
+
+## The cancel() method
+
+```typescript
+async cancel(reason: unknown = new CancellationError()): Promise<StatusEvent | Error | undefined>
+```
+
+`cancel()` is an async method that aborts the `Future`'s internal `AbortController` and waits for the `cancelled` status event to propagate. It returns the `StatusEvent` for the `cancelled` transition, giving you the cancellation reason without needing to subscribe to events manually.
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1;
+  yield 2;
+  return 3;
+});
+
+const event = await future.cancel();
+console.log(event?.status);  // "cancelled"
+```
+
+If you pass a custom reason it is used instead of the default `CancellationError`:
+
+```typescript
+const event = await future.cancel(new Error("user clicked stop"));
+console.log(event?.detail); // { reason: Error("user clicked stop") }
+```
+
+## CancellationError
+
+`CancellationError` is the default cancellation reason used when `cancel()` is called without arguments.
+
+```typescript
+class CancellationError extends Error {
+  constructor() {
+    super("Future was canceled");
+  }
+}
+```
+
+When your generator catches an error or a `for await...of` loop throws, you can check `err instanceof CancellationError` to distinguish a deliberate cancellation from an unexpected failure.
+
+```typescript
+import { from, CancellationError } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1;
+  return 2;
+});
+
+setTimeout(() => future.cancel(), 50);
+
+try {
+  for await (const value of future) {
+    await new Promise(r => setTimeout(r, 200)); // slow consumer
+  }
+} catch (err) {
+  if (err instanceof CancellationError) {
+    console.log("Cancelled cleanly");
+  } else {
+    throw err; // unexpected error — rethrow
+  }
+}
+```
+
+## How cancellation propagates
+
+When `cancel(reason)` is called, the following sequence occurs:
+
+<Steps>
+  <Step title="AbortController.abort(reason) is called">
+    The internal `AbortController` is aborted with the provided reason. This fires an `"abort"` event on the signal.
+  </Step>
+  <Step title="The abort event listener fires">
+    The `Future`'s private event handler receives the `"abort"` event and sets the status to `cancelled`, dispatching a `StatusEvent`.
+  </Step>
+  <Step title="The generator wrapper races against the event">
+    The internal `#getNextResult` method uses `Promise.race` between the next generator step and the `cancelled` status event. When cancellation wins the race, it throws the abort reason.
+  </Step>
+  <Step title="generator.return() is called">
+    The `#handleError` method calls `generator.return(undefined)` so that any `finally` blocks inside your generator execute for cleanup. This is bounded by `GENERATOR_RETURN_TIMEOUT` (1 000 ms) to prevent hangs.
+  </Step>
+  <Step title="cancel() resolves">
+    The returned promise resolves with the `StatusEvent` for the `cancelled` state.
+  </Step>
+</Steps>
+
+## Checking for cancellation inside a generator
+
+Your `FutureOperation` receives the `AbortController` as its first argument. Use `abort.signal.throwIfAborted()` inside your generator to exit early at any checkpoint:
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* (abort) {
+  for (let i = 0; i < 1_000; i++) {
+    abort.signal.throwIfAborted(); // throws the abort reason if cancelled
+    await new Promise(r => setTimeout(r, 10));
+    yield i;
+  }
+  return "complete";
+});
+
+setTimeout(() => future.cancel(), 150);
+
+try {
+  for await (const value of future) {
+    console.log(value); // 0, 1, 2, ... up to ~15
+  }
+} catch (err) {
+  console.log("stopped:", err.message); // "Future was canceled"
+}
+```
+
+`throwIfAborted()` is a no-op when the signal has not been aborted, so it is safe to call in tight loops.
+
+## Cancelling after a timeout
+
+A common pattern is cancelling a `Future` if it does not complete within a time budget:
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* (abort) {
+  const response = await fetch("https://api.example.com/data", {
+    signal: abort.signal, // forward the signal to fetch
+  });
+  const data = await response.json();
+  yield data;
+  return data;
+});
+
+const timeoutId = setTimeout(() => future.cancel(), 5_000);
+
+try {
+  const result = await future.toPromise();
+  clearTimeout(timeoutId);
+  console.log(result);
+} catch (err) {
+  console.error("Timed out or failed:", err.message);
+}
+```
+
+<Tip>
+Passing `abort.signal` directly to `fetch` (or any `AbortSignal`-aware API) means the network request is also cancelled immediately when the `Future` is cancelled — no wasted bandwidth.
+</Tip>
+
+## Cancelling from a UI event
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* (abort) {
+  for await (const chunk of streamLargeDataset(abort.signal)) {
+    yield processChunk(chunk);
+  }
+  return "done";
+});
+
+document.getElementById("stop-btn")?.addEventListener("click", () => {
+  future.cancel(); // returns a promise; you can await it if needed
+});
+
+for await (const processed of future) {
+  renderItem(processed);
+}
+```
+
+## Cancelling a group of Futures
+
+Because `cancel()` is just an async method, you can cancel multiple `Future` instances in parallel with `Promise.all`:
+
+```typescript
+import { from } from "@okikio/future";
+
+const futures = [
+  from(async function* (abort) { /* task 1 */ }),
+  from(async function* (abort) { /* task 2 */ }),
+  from(async function* (abort) { /* task 3 */ }),
+];
+
+// Cancel all simultaneously
+await Promise.all(futures.map(f => f.cancel()));
+```
+
+## Disposal automatically cancels
+
+`[Symbol.asyncDispose]()` calls `dispose()` internally, which calls `cancel()` before cleaning up resources. This means that when a `Future` goes out of scope in an `await using` block, it is automatically cancelled if it has not already completed.
+
+```typescript
+import { from } from "@okikio/future";
+
+async function fetchWithTimeout() {
+  await using future = from(async function* (abort) {
+    const res = await fetch("https://api.example.com/slow", { signal: abort.signal });
+    yield await res.json();
+  });
+
+  return await future.toPromise();
+  // If an exception is thrown above, dispose() cancels the future automatically
+}
+```
+
+## GENERATOR_RETURN_TIMEOUT
+
+When `cancel()` triggers cleanup, the `Future` calls `generator.return()` to give your generator a chance to run `finally` blocks. This is bounded by a 1 000 ms timeout (`GENERATOR_RETURN_TIMEOUT`). If cleanup does not finish within that window, the `Future` proceeds with cancellation anyway and logs a warning. This prevents a misbehaving generator from blocking cancellation indefinitely.
+
+<Warning>
+Keep cleanup logic in `finally` blocks brief and non-blocking. If your cleanup itself needs to perform async work (e.g. flushing a buffer), ensure it completes well within 1 second or the `Future` will abandon it.
+</Warning>
+
+<CardGroup cols={2}>
+  <Card title="Future lifecycle" href="/concepts/future-lifecycle">
+    All six lifecycle states and the methods that transition between them
+  </Card>
+  <Card title="Async generators" href="/concepts/async-generators">
+    How yield, return, and the FutureOperation type work together
+  </Card>
+  <Card title="Disposal" href="/concepts/disposal">
+    await using, AsyncDisposableStack, and automatic cleanup
+  </Card>
+</CardGroup>

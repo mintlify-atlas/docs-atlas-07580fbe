@@ -1,0 +1,127 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Future",
+  "projectDescription": "A powerful TypeScript async primitive library offering cancellable, pausable, and composable Futures as a superior alternative to native Promises.",
+  "theme": "luma",
+  "primaryColor": "#4F46E5",
+  "lightColor": "#818CF8",
+  "darkColor": "#312E81",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/future-lifecycle",
+              "concepts/async-generators",
+              "concepts/cancellation",
+              "concepts/disposal"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/concurrency",
+              "guides/background-execution",
+              "guides/error-handling",
+              "guides/streams-and-iterables"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Future Class",
+            "pages": [
+              "api/future",
+              "api/from",
+              "api/status"
+            ]
+          },
+          {
+            "group": "Concurrency",
+            "pages": [
+              "api/all",
+              "api/race",
+              "api/scope",
+              "api/concurrency-limit"
+            ]
+          },
+          {
+            "group": "Utilities",
+            "pages": [
+              "api/deadline",
+              "api/abortable",
+              "api/split",
+              "api/resolvers",
+              "api/disposal"
+            ]
+          },
+          {
+            "group": "Types",
+            "pages": [
+              "api/types"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Cancellable async operations with AbortController integration",
+    "Pausable and resumable execution via generator-based control flow",
+    "Composable concurrency primitives: all, race, allSettled, scope, and withConcurrencyLimit",
+    "Background execution using requestIdleCallback",
+    "First-class support for async/sync iterables, streams, and generators",
+    "Automatic resource management via Explicit Resource Management (using/await using)",
+    "Built-in deadline and timeout enforcement",
+    "Stream splitting by value or predicate",
+    "Promise-compatible: supports then/catch/finally and await syntax",
+    "Multi-runtime: Deno, Node.js, Bun, Cloudflare Workers, and browsers"
+  ],
+  "publicApiSurface": [
+    "Future (class)",
+    "from(operation)",
+    "of(value)",
+    "fromPromise(promise)",
+    "fromOperation(operation)",
+    "fromIterable(iterable)",
+    "fromIterator(iterator)",
+    "fromStream(stream)",
+    "is(value)",
+    "all(futures)",
+    "allSettled(futures)",
+    "race(futures)",
+    "some(futures, count)",
+    "withConcurrencyLimit(futures, limit)",
+    "scope(futures)",
+    "inBackground(future)",
+    "withDeadline(future, ms)",
+    "delay(ms, value?)",
+    "withAbortable(future, abort)",
+    "split(future)",
+    "splitBy(future, predicate)",
+    "withResolvers()",
+    "abortable(abort)",
+    "timeout(ms, options?)",
+    "useDisposableStack(value, stack)",
+    "CancellationError",
+    "Status",
+    "StatusEvent",
+    "DualDisposable (interface)",
+    "FutureOperation (interface)",
+    "FutureWithResolvers (interface)"
+  ]
+}

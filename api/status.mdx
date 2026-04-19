@@ -1,0 +1,244 @@
+---
+title: "Status and StatusEvent API reference"
+description: "API reference for Future's Status enum and StatusEvent class. Covers all lifecycle states: idle, running, paused, completed, cancelled, and destroyed."
+---
+
+Every `Future` moves through a well-defined set of lifecycle states. The `Status` constant object holds the string literal for each state, `StatusEnum` is the union type of all possible values, and `StatusEvent` is the `CustomEvent` subclass dispatched internally whenever a transition occurs. Together they give you a precise, type-safe way to inspect and react to a Future's lifecycle.
+
+---
+
+## `Status`
+
+```typescript
+const Status = {
+  Idle:      "idle",
+  Running:   "running",
+  Paused:    "paused",
+  Completed: "completed",
+  Cancelled: "cancelled",
+  Destroyed: "destroyed",
+} as const;
+
+type StatusEnum = typeof Status[keyof typeof Status];
+```
+
+Use `Status` as a namespace for status string literals to avoid raw-string comparisons.
+
+```typescript
+import { Status } from "@okikio/future";
+
+if (future.is(Status.Paused)) {
+  future.resume();
+}
+
+const status = future.getStatus();
+console.log(status); // "paused"
+```
+
+### Status values
+
+<ResponseField name="Status.Idle" type='"idle"'>
+  The initial state of every Future. The internal generator exists but has not yet started executing. A Future returns to `"idle"` after a successful `reset()`.
+</ResponseField>
+
+<ResponseField name="Status.Running" type='"running"'>
+  The Future is actively executing — `next()` has been called at least once and the generator has not yet finished. A paused Future transitions back to `"running"` when `resume()` is called.
+</ResponseField>
+
+<ResponseField name="Status.Paused" type='"paused"'>
+  Execution is suspended. The generator is waiting at a `yield` point. Calls to `next()` block until `resume()` is called. The Future transitions into this state when `pause()` is called while running.
+</ResponseField>
+
+<ResponseField name="Status.Completed" type='"completed"'>
+  The generator has returned a final value (its `done` flag is `true`) or `complete(value)` was called manually. A completed Future can be `reset()` and re-run.
+</ResponseField>
+
+<ResponseField name="Status.Cancelled" type='"cancelled"'>
+  The Future's `AbortController` was aborted — either by calling `cancel()` explicitly or by the abort signal firing. A cancelled Future can be `reset()` and re-run.
+</ResponseField>
+
+<ResponseField name="Status.Destroyed" type='"destroyed"'>
+  The Future has been fully torn down by `dispose()`. All internal references are nulled. This state is terminal — a destroyed Future cannot be reset, cloned, or iterated.
+</ResponseField>
+
+### Lifecycle diagram
+
+```
+         reset()               resume()
+  ┌──────────────────┐    ┌────────────────┐
+  │                  ▼    │                ▼
+Idle ──next()──► Running ──pause()──► Paused
+                   │
+       cancel() ───┼──────────► Cancelled ──reset()──► Idle
+                   │
+      complete() ──┴──────────► Completed ──reset()──► Idle
+                   │
+      dispose() ───┴──────────► Destroyed  (terminal)
+```
+
+<Warning>
+  `"destroyed"` is the only terminal state. Once `dispose()` is called, the Future cannot be recovered. Calling `[Symbol.asyncIterator]()` or `clone()` on a destroyed Future throws immediately.
+</Warning>
+
+---
+
+## `StatusEvent`
+
+```typescript
+class StatusEvent<
+  T extends StatusEnum = typeof Status.Idle,
+  TDetail = unknown
+> extends CustomEvent<TDetail>
+```
+
+A typed subclass of `CustomEvent` dispatched by a Future's internal event system each time its status changes. The `status` property mirrors the `type`-based routing used internally.
+
+### Constructor
+
+```typescript
+new StatusEvent(status?: T, detail?: TDetail)
+```
+
+<ParamField path="status" type="T extends StatusEnum">
+  The status this event represents. Defaults to `Status.Idle` (`"idle"`). The `CustomEvent` `type` is hardcoded to `"status"` regardless of this value; the actual status is carried in the `status` property.
+</ParamField>
+
+<ParamField path="detail" type="TDetail">
+  Optional structured data attached to the event. The value is shallow-cloned via `Object.assign({}, detail)` before being passed to `CustomEvent`. See `StatusEventDetailMap` below for the expected shape per status.
+</ParamField>
+
+### Properties
+
+<ResponseField name="status" type="T extends StatusEnum">
+  The specific lifecycle status this event represents. Read this to distinguish events in a listener that handles multiple statuses.
+</ResponseField>
+
+<ResponseField name="detail" type="TDetail">
+  Inherited from `CustomEvent<TDetail>`. Contains the structured data for this status transition.
+</ResponseField>
+
+---
+
+## `StatusEventDetailMap`
+
+Maps each `StatusEnum` value to the shape of its `detail` payload.
+
+```typescript
+interface StatusEventDetailMap extends Record<StatusEnum, unknown> {
+  idle:      unknown;
+  running:   unknown;
+  paused:    unknown;
+  completed: { value: unknown };
+  cancelled: { reason: unknown };
+  destroyed: unknown;
+}
+```
+
+<ResponseField name="idle" type="unknown">
+  No structured detail. Emitted on construction and after `reset()`.
+</ResponseField>
+
+<ResponseField name="running" type="unknown">
+  No structured detail. Emitted when execution starts or resumes from a paused state.
+</ResponseField>
+
+<ResponseField name="paused" type="unknown">
+  No structured detail. Emitted when `pause()` transitions a running Future to paused.
+</ResponseField>
+
+<ResponseField name="completed" type="{ value: unknown }">
+  Contains the final resolved value of the generator.
+
+  <Expandable title="properties">
+    <ResponseField name="value" type="unknown">
+      The value returned by the generator or passed to `complete(value)`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="cancelled" type="{ reason: unknown }">
+  Contains the cancellation reason from the `AbortController`.
+
+  <Expandable title="properties">
+    <ResponseField name="reason" type="unknown">
+      The reason passed to `cancel(reason)`, or a `CancellationError` instance if no reason was supplied.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="destroyed" type="unknown">
+  No structured detail. Emitted as the very last action of `dispose()`.
+</ResponseField>
+
+---
+
+## Usage examples
+
+### Checking status with `is()` and `getStatus()`
+
+```typescript
+import { from, Status } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1;
+  return 2;
+});
+
+console.log(future.is(Status.Idle));    // true  — before first next()
+console.log(future.getStatus());        // "idle"
+
+future.pause();
+console.log(future.is(Status.Paused)); // true
+console.log(future.getStatus());       // "paused"
+
+future.resume();
+console.log(future.is(Status.Running)); // true
+
+const result = await future.toPromise();
+console.log(future.is(Status.Completed)); // true
+console.log(result);                      // 2
+```
+
+### Guarding against invalid transitions
+
+```typescript
+import { Future, Status } from "@okikio/future";
+
+async function safeReset(future: Future<unknown, unknown, unknown>) {
+  if (
+    future.is(Status.Completed) ||
+    future.is(Status.Cancelled)
+  ) {
+    future.reset();
+  } else {
+    console.warn("Future is not in a resettable state:", future.getStatus());
+  }
+}
+```
+
+### Reacting to cancellation
+
+```typescript
+import { from, Status } from "@okikio/future";
+
+const future = from(async function* (abort) {
+  for (let i = 0; i < 100; i++) {
+    abort.signal.throwIfAborted();
+    yield i;
+  }
+  return "done";
+});
+
+// Cancel after 50 ms
+setTimeout(() => future.cancel("timeout"), 50);
+
+try {
+  for await (const value of future) {
+    console.log(value);
+  }
+} catch (err) {
+  if (future.is(Status.Cancelled)) {
+    console.log("Future was cancelled:", err);
+  }
+}
+```

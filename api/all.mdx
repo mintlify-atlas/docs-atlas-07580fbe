@@ -1,0 +1,213 @@
+---
+title: "all(), allSettled(), and some() API reference"
+description: "Run multiple Futures concurrently with all(), collect all settled results with allSettled(), or limit to N futures with some(). API reference with examples."
+---
+
+The `all()`, `allSettled()`, and `some()` functions let you run multiple `Future` instances concurrently. They mirror the semantics of `Promise.all`, `Promise.allSettled`, and a sliced variant thereof, while extending them with support for incremental yielding, structured disposal, and full `Future` composability.
+
+## `all()`
+
+Runs every future in the iterable concurrently, waits for all of them to resolve, and yields each result before returning the complete array. If any future rejects, the entire operation rejects immediately.
+
+### Signature
+
+```typescript
+function all<T, TReturn, TNext>(
+  futures: Iterable<Future<T, TReturn, TNext> | PromiseLike<T | TReturn>>,
+): Future<Awaited<T | TReturn>, Awaited<T | TReturn>[]>
+```
+
+### Parameters
+
+<ParamField path="futures" type="Iterable<Future<T, TReturn, TNext> | PromiseLike<T | TReturn>>" required>
+  An iterable of `Future` instances or any `PromiseLike` objects to run concurrently.
+</ParamField>
+
+### Return value
+
+<ResponseField name="return" type="Future<Awaited<T | TReturn>, Awaited<T | TReturn>[]>">
+  A `Future` that yields each resolved value and returns an array of all resolved values in the order futures completed. Rejects immediately if any input future rejects.
+</ResponseField>
+
+<Warning>
+  If any future in the iterable rejects, `all()` rejects and the remaining futures are disposed. Use `allSettled()` if you need results from all futures regardless of failure.
+</Warning>
+
+### Example
+
+<CodeGroup>
+
+```typescript Basic usage
+import { from, all } from "@okikio/future";
+
+const results = await all([
+  from(async function* () {
+    yield 42;
+    return 100;
+  }),
+  from(async function* () {
+    yield 10;
+    return 20;
+  }),
+]).toPromise();
+
+console.log(results); // [100, 20]
+```
+
+```typescript Iterating intermediate values
+import { from, all } from "@okikio/future";
+
+const future1 = from(async function* () { yield 1; return "a"; });
+const future2 = from(async function* () { yield 2; return "b"; });
+
+for await (const value of all([future1, future2])) {
+  console.log(value); // "a", "b" — the return values once all resolve
+}
+```
+
+</CodeGroup>
+
+---
+
+## `allSettled()`
+
+Runs every future in the iterable concurrently and collects all results, whether fulfilled or rejected. Never rejects — each result is a `PromiseSettledResult` object with a `status` field of either `"fulfilled"` or `"rejected"`.
+
+### Signature
+
+```typescript
+function allSettled<T, TReturn, TNext>(
+  futures: Iterable<Future<T, TReturn, TNext> | PromiseLike<T | TReturn>>,
+): Future<
+  PromiseSettledResult<T | TReturn>,
+  PromiseSettledResult<T | TReturn>[]
+>
+```
+
+### Parameters
+
+<ParamField path="futures" type="Iterable<Future<T, TReturn, TNext> | PromiseLike<T | TReturn>>" required>
+  An iterable of `Future` instances or `PromiseLike` objects to run concurrently.
+</ParamField>
+
+### Return value
+
+<ResponseField name="return" type="Future<PromiseSettledResult<T | TReturn>, PromiseSettledResult<T | TReturn>[]>">
+  A `Future` that yields settled result objects and returns an array of all settled results. Each result has a `status` of `"fulfilled"` with a `value`, or `"rejected"` with a `reason`. Never rejects.
+</ResponseField>
+
+<Note>
+  `allSettled()` waits for every future to finish before yielding any results, matching the behavior of `Promise.allSettled`.
+</Note>
+
+### Example
+
+```typescript
+import { from, allSettled } from "@okikio/future";
+
+const future1 = from(async function* () {
+  yield 42;
+  return 100;
+});
+
+const future2 = from(async function* () {
+  throw new Error("something went wrong");
+});
+
+for await (const result of allSettled([future1, future2])) {
+  if (result.status === "fulfilled") {
+    console.log(result.value);  // 100
+  } else {
+    console.error(result.reason); // Error: something went wrong
+  }
+}
+```
+
+---
+
+## `some()`
+
+Takes the first `count` futures from the iterable and runs `allSettled()` on them. Futures beyond the `count` limit are never started.
+
+### Signature
+
+```typescript
+function some<T, TReturn, TNext>(
+  futures: Iterable<Future<T, TReturn, TNext> | PromiseLike<T | TReturn>>,
+  count: number,
+): Future<PromiseSettledResult<T | TReturn>, PromiseSettledResult<T | TReturn>[]>
+```
+
+### Parameters
+
+<ParamField path="futures" type="Iterable<Future<T, TReturn, TNext> | PromiseLike<T | TReturn>>" required>
+  An iterable of `Future` instances or `PromiseLike` objects.
+</ParamField>
+
+<ParamField path="count" type="number" required>
+  The number of futures to take from the front of the iterable. Futures at index `count` and beyond are ignored.
+</ParamField>
+
+### Return value
+
+<ResponseField name="return" type="Future<PromiseSettledResult<T | TReturn>, PromiseSettledResult<T | TReturn>[]>">
+  A `Future` equivalent to calling `allSettled()` on the first `count` futures. Returns an array of settled results. Never rejects.
+</ResponseField>
+
+### Example
+
+```typescript
+import { from, some } from "@okikio/future";
+
+const f1 = from(async function* () { return "a"; });
+const f2 = from(async function* () { return "b"; });
+const f3 = from(async function* () { return "c"; });
+const f4 = from(async function* () { return "d"; });
+
+// Only f1 and f2 are executed
+const firstTwo = await some([f1, f2, f3, f4], 2).toPromise();
+console.log(firstTwo);
+// [
+//   { status: "fulfilled", value: "a" },
+//   { status: "fulfilled", value: "b" }
+// ]
+```
+
+---
+
+## Comparison
+
+<Tabs>
+  <Tab title="all()">
+    Use `all()` when every future must succeed. It rejects as soon as any input rejects, matching `Promise.all` semantics. Best for operations where partial results are not useful — for example, fetching a set of required resources where any failure means you cannot proceed.
+
+    ```typescript
+    const [user, settings, permissions] = await all([
+      fetchUser(id),
+      fetchSettings(id),
+      fetchPermissions(id),
+    ]).toPromise();
+    ```
+  </Tab>
+  <Tab title="allSettled()">
+    Use `allSettled()` when you need results from all futures regardless of individual failures. Each result carries a `status` so you can handle successes and errors separately. Best for fan-out operations like sending notifications or running health checks across many services.
+
+    ```typescript
+    const results = await allSettled([
+      notifySlack(),
+      notifyEmail(),
+      notifyWebhook(),
+    ]).toPromise();
+
+    const failures = results.filter(r => r.status === "rejected");
+    ```
+  </Tab>
+  <Tab title="some()">
+    Use `some()` when you only care about the first N items from a larger collection. It slices the iterable before running anything, so later futures are never constructed or started.
+
+    ```typescript
+    // Run only the first 3 of many possible jobs
+    const results = await some(jobQueue, 3).toPromise();
+    ```
+  </Tab>
+</Tabs>

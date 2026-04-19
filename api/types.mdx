@@ -1,0 +1,295 @@
+---
+title: "TypeScript types and interfaces — @okikio/future reference"
+description: "Complete reference for all TypeScript types exported by @okikio/future: FutureOperation, DualDisposable, StatusEnum, CancellationError, and more."
+---
+
+This page documents every TypeScript type and interface exported by `@okikio/future`. Most of these types appear in function signatures and return types throughout the library — understanding them helps you annotate your own code correctly and understand what the library's generics mean at each call site.
+
+---
+
+## Disposal types
+
+### `DualDisposable`
+
+```typescript
+interface DualDisposable extends Disposable, AsyncDisposable {}
+```
+
+An object that implements both synchronous disposal (`[Symbol.dispose]()`) and asynchronous disposal (`[Symbol.asyncDispose]()`). The library uses this as the base for composite objects that need to support both `using` and `await using` in the same context.
+
+Several return types in `@okikio/future` extend `DualDisposable` — for example, the tuples returned by `split()` and `splitBy()`, and the objects returned by `abortable()` and `timeout()`.
+
+```typescript
+class MyResource implements DualDisposable {
+  [Symbol.dispose]() {
+    // synchronous cleanup
+  }
+
+  async [Symbol.asyncDispose]() {
+    // asynchronous cleanup
+  }
+}
+
+using resource = new MyResource(); // calls [Symbol.dispose]() on block exit
+await using asyncResource = new MyResource(); // calls [Symbol.asyncDispose]()
+```
+
+---
+
+### `WithDisposal<T>`
+
+```typescript
+type WithDisposal<T> = T & (Disposable | AsyncDisposable | DualDisposable)
+```
+
+A utility type that intersects any type `T` with one of the disposal interfaces. Used by `useDisposableStack()` to represent resources that have been registered with a stack and are now guaranteed to be disposable.
+
+```typescript
+// A DatabaseConnection that also has a [Symbol.dispose]() method
+type ManagedConnection = WithDisposal<DatabaseConnection>;
+```
+
+---
+
+### `PromiseWithDisposal<T>`
+
+```typescript
+interface PromiseWithDisposal<T> extends Promise<T>, DualDisposable {}
+```
+
+A `Promise<T>` that also implements `[Symbol.dispose]()` and `[Symbol.asyncDispose]()`. Returned by `timeout()`. The disposal methods clean up underlying timers or event listeners so you do not need to track them manually.
+
+```typescript
+import { timeout } from "@okikio/future/disposal";
+
+const t = timeout(5000);
+// t is a PromiseWithDisposal<void>
+
+try {
+  await t;
+} finally {
+  t[Symbol.dispose](); // clears the timer
+}
+```
+
+---
+
+### `AbortablePromiseWithDisposal<T>`
+
+```typescript
+interface AbortablePromiseWithDisposal<T> extends PromiseWithDisposal<T> {
+  signal: AbortSignal | null;
+  controller: AbortController | null;
+}
+```
+
+Extends `PromiseWithDisposal<T>` with references to the abort handle used to create the promise. Returned by `abortable()`.
+
+<ResponseField name="signal" type="AbortSignal | null">
+  The `AbortSignal` the promise is listening to. Set to `null` after `[Symbol.dispose]()` is called.
+</ResponseField>
+
+<ResponseField name="controller" type="AbortController | null">
+  The `AbortController`, if one was passed to `abortable()`. `null` if an `AbortSignal` was passed directly, or after disposal.
+</ResponseField>
+
+---
+
+## Future operation types
+
+### `FutureOperation<T, TReturn, TNext>`
+
+```typescript
+interface FutureOperation<T, TReturn, TNext> {
+  (
+    abort: AbortController,
+    disposables: AsyncDisposableStack,
+  ): AsyncGenerator<T, TReturn, TNext> | Generator<T, TReturn, TNext>;
+}
+```
+
+The type for the generator function passed to `new Future()`. It receives two arguments from the Future runtime:
+
+<ResponseField name="abort" type="AbortController">
+  The internal abort controller for this Future. Call `abort.signal.throwIfAborted()` to check for cancellation at yield points, or listen to `abort.signal` for fine-grained control.
+</ResponseField>
+
+<ResponseField name="disposables" type="AsyncDisposableStack">
+  A stack of cleanup callbacks that run when the Future finishes, is cancelled, or is disposed. Use `disposables.use(resource)` to register any resource that implements `AsyncDisposable` or `Disposable`.
+</ResponseField>
+
+```typescript
+import { Future } from "@okikio/future";
+
+const future = new Future<number, string>(async function* (abort, disposables) {
+  const conn = disposables.use(new DatabaseConnection());
+  yield await conn.query("SELECT count(*) FROM users");
+  return "done";
+});
+```
+
+---
+
+### `FutureFromOperation<T, TReturn, TNext>`
+
+```typescript
+interface FutureFromOperation<T, TReturn, TNext> {
+  (
+    abort: AbortController,
+    disposables: AsyncDisposableStack,
+  ): ReturnType<FutureOperation<T, TReturn, TNext>> | PromiseLike<T> | T;
+}
+```
+
+The extended operation type used by `from()`. Unlike `FutureOperation`, the function can return a generator, a `PromiseLike<T>`, or a plain value `T`. `from()` detects which form is returned and adapts accordingly, making it suitable for wrapping existing promises or simple async functions as well as generators.
+
+```typescript
+import { from } from "@okikio/future";
+
+// Plain promise — valid FutureFromOperation
+const future = from(() => fetch("https://api.example.com/data").then(r => r.json()));
+
+// Generator — also a valid FutureFromOperation
+const generatorFuture = from(async function* () {
+  yield 1;
+  return 2;
+});
+```
+
+---
+
+### `FutureWithResolvers<TReturn>`
+
+```typescript
+interface FutureWithResolvers<TReturn>
+  extends Omit<PromiseWithResolvers<TReturn>, "promise"> {
+  future: Future<TReturn, TReturn, undefined>;
+  resolve: (value: TReturn | PromiseLike<TReturn>) => void;
+  reject: (reason?: unknown) => void;
+}
+```
+
+The return type of `withResolvers()`. Extends the standard `PromiseWithResolvers<TReturn>` interface, replacing the `promise` property with a `future`. The `resolve` and `reject` methods have identical signatures to their promise counterparts.
+
+See the [`withResolvers()` reference](/api/resolvers) for usage examples.
+
+---
+
+## Status types
+
+### `StatusEnum`
+
+```typescript
+type StatusEnum = "idle" | "running" | "paused" | "completed" | "cancelled" | "destroyed"
+```
+
+The union of all valid Future status strings. Derived from the `Status` constant object:
+
+```typescript
+const Status = {
+  Idle:      "idle",
+  Running:   "running",
+  Paused:    "paused",
+  Completed: "completed",
+  Cancelled: "cancelled",
+  Destroyed: "destroyed",
+} as const;
+```
+
+Use the `Status` object constants in code rather than raw strings to get autocomplete and avoid typos:
+
+```typescript
+import { Status } from "@okikio/future";
+
+if (future.is(Status.Cancelled)) {
+  console.log("Future was cancelled");
+}
+```
+
+---
+
+### `StatusEventDetailMap`
+
+```typescript
+interface StatusEventDetailMap extends Record<StatusEnum, unknown> {
+  idle:      unknown;
+  running:   unknown;
+  paused:    unknown;
+  completed: { value: unknown };
+  cancelled: { reason: unknown };
+  destroyed: unknown;
+}
+```
+
+Maps each `StatusEnum` value to the shape of the detail object carried by the corresponding `StatusEvent`. The two most informative entries are:
+
+<ResponseField name="completed" type="{ value: unknown }">
+  The `value` field holds the resolved return value of the Future at completion time.
+</ResponseField>
+
+<ResponseField name="cancelled" type="{ reason: unknown }">
+  The `reason` field holds the cancellation reason — typically a `CancellationError` or the value passed to `cancel(reason)`.
+</ResponseField>
+
+---
+
+## Error types
+
+### `CancellationError`
+
+```typescript
+class CancellationError extends Error {
+  constructor() {
+    super("Future was canceled");
+  }
+}
+```
+
+The default cancellation reason used when `cancel()` is called without an argument. It extends the native `Error` class, so it can be caught with a standard `try/catch` block and identified with `instanceof CancellationError`.
+
+```typescript
+import { from, CancellationError } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1;
+  yield 2;
+  return 3;
+});
+
+future.cancel(); // cancels with a CancellationError
+
+try {
+  await future.toPromise();
+} catch (e) {
+  if (e instanceof CancellationError) {
+    console.log("Future was cancelled:", e.message); // "Future was canceled"
+  }
+}
+```
+
+<Note>
+  When you call `cancel(reason)` with an explicit `reason`, that value is used instead of a `CancellationError`. Check `instanceof CancellationError` only when you have not provided a custom reason.
+</Note>
+
+---
+
+## Disposal options
+
+### `TimeoutOptions`
+
+```typescript
+interface TimeoutOptions {
+  reject?: boolean; // default: true
+  abort?: AbortController | AbortSignal;
+}
+```
+
+Options accepted by the `timeout()` function.
+
+<ResponseField name="reject" type="boolean" default="true">
+  When `true`, the promise returned by `timeout()` rejects with `new Error("Timeout exceeded")` after the specified delay. When `false`, the promise resolves with `undefined` instead — useful when you want a timer to signal completion rather than failure.
+</ResponseField>
+
+<ResponseField name="abort" type="AbortController | AbortSignal">
+  An optional abort handle. If the signal fires before the timer elapses, the promise rejects with `signal.reason` immediately. This allows you to cancel the timeout itself from outside, for example when the operation it is racing against completes successfully.
+</ResponseField>

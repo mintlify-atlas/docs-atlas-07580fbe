@@ -1,0 +1,132 @@
+---
+title: "What is Future? Cancellable Async Primitives for TypeScript"
+description: "Future replaces JavaScript Promises with cancellable, pausable async primitives built on generators. Works in Deno, Node.js, Bun, and browsers."
+---
+
+`@okikio/future` is a TypeScript library that brings structured concurrency and full lifecycle control to asynchronous code. Built on async generators, a `Future` behaves like a `Promise` — you can `await` it, chain `.then()`, and compose it with other async work — but it also lets you pause, resume, and cancel execution at any point in its lifecycle.
+
+## The problem with Promises
+
+JavaScript Promises are fire-and-forget. Once you call an async function, the work runs to completion regardless of whether you still need the result. There is no built-in way to cancel a fetch that is no longer relevant, pause a long-running background task, or cleanly dispose of resources when a component unmounts.
+
+The typical workarounds — `AbortController` wired by hand, flag variables, ad-hoc cleanup code — add complexity without solving the underlying problem. `Future` solves it at the primitive level.
+
+## How Future works
+
+Every `Future` is backed by an async generator. The generator's `yield` points become natural checkpoints where execution can be paused or cancelled. The `Future` class manages the generator's lifecycle, wires up an `AbortController` for cancellation, and exposes an `AsyncDisposableStack` for resource cleanup — all while implementing `PromiseLike` so it drops in wherever a `Promise` is expected.
+
+```typescript
+import { from } from "@okikio/future";
+
+const future = from(async function* () {
+  yield 1; // pauses here, emits 1
+  yield 2; // pauses here, emits 2
+  return 3; // completes, resolves to 3
+});
+
+for await (const value of future) {
+  console.log(value); // Logs 1, 2
+}
+
+console.log(await future.toPromise()); // Logs 3
+```
+
+## Before and after
+
+The following examples show the same pattern — fetching data with a timeout and cancellation — written with a raw `Promise` and then with a `Future`.
+
+<CodeGroup>
+
+```typescript Promise (before)
+const controller = new AbortController();
+const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+let result;
+try {
+  const response = await fetch("/api/data", { signal: controller.signal });
+  result = await response.json();
+} catch (err) {
+  if (err.name === "AbortError") {
+    console.log("Request timed out");
+  } else {
+    throw err;
+  }
+} finally {
+  clearTimeout(timeoutId);
+}
+```
+
+```typescript Future (after)
+import { from, withDeadline } from "@okikio/future";
+
+const future = withDeadline(
+  from(async function* () {
+    const response = await fetch("/api/data");
+    const data = await response.json();
+    yield data;
+    return data;
+  }),
+  5000, // cancel after 5 seconds
+);
+
+try {
+  const result = await future.toPromise();
+  console.log(result);
+} catch (err) {
+  console.log("Request timed out:", err.message);
+}
+```
+
+</CodeGroup>
+
+With `Future`, the timeout, abort signal wiring, and cleanup are handled by the library. Your generator focuses on the task.
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Cancellable" icon="ban">
+    Call `future.cancel()` at any time. Cancellation propagates through the async generator via `AbortController` and cleans up registered disposables automatically.
+  </Card>
+  <Card title="Pausable" icon="pause">
+    Call `future.pause()` to halt execution at the next `yield`. Call `future.resume()` when you are ready to continue — no lost state.
+  </Card>
+  <Card title="Composable" icon="layer-group">
+    Combine Futures using `all`, `race`, `allSettled`, `withConcurrencyLimit`, `withDeadline`, and `withAbortable`. Each returns a new `Future` you can control in the same way.
+  </Card>
+  <Card title="Promise-compatible" icon="check">
+    `Future` implements `PromiseLike`. Use `await`, `.then()`, `.catch()`, `.finally()`, or `for await...of` — it works wherever a Promise does.
+  </Card>
+</CardGroup>
+
+## Supported runtimes
+
+`@okikio/future` has no runtime-specific dependencies. It runs in any environment that supports async generators and `AbortController`.
+
+| Runtime | Support |
+|---|---|
+| Deno | Full support via JSR |
+| Node.js | Full support via npm |
+| Bun | Full support via npm or JSR |
+| Cloudflare Workers | Full support |
+| Browsers | Full support (modern evergreen) |
+
+<Note>
+Some features — such as `ReadableStream` integration via `fromStream` — require a browser-compatible global environment. If you use these in Node.js, set `"lib": ["dom"]` in your `tsconfig.json`.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Create your first Future, iterate values, and cancel a task in under 5 minutes.
+  </Card>
+  <Card title="Installation" icon="package" href="/installation">
+    Install via JSR or npm and configure sub-path imports for tree-shaking.
+  </Card>
+  <Card title="Core concepts" icon="lightbulb" href="/concepts/future-lifecycle">
+    Understand the Future lifecycle: idle, running, paused, cancelled, and completed.
+  </Card>
+  <Card title="API reference" icon="code" href="/api/future">
+    Explore the full API surface including the `Future` class and all utility functions.
+  </Card>
+</CardGroup>
